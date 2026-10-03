@@ -19,6 +19,16 @@ lake-executor 를 AWS EC2(서울, ap-northeast-2) 에 올려 24시간 돌리는 
 
 ---
 
+## 0. 자격증명을 어디서 읽나
+
+`deploy/provision.py` 는 다음 순서로 AWS 자격증명을 찾는다.
+
+1. 환경변수 `DEPLOY_AWS_ACCESS_KEY_ID` / `DEPLOY_AWS_SECRET_ACCESS_KEY` (Claude 클라우드 세션의 환경 설정에 넣을 때 사용. `AWS_*` 이름은 세션 프록시가 더미 값으로 점유하므로 쓰지 않는다)
+2. `AWS_PROFILE` 환경변수로 지정한 `~/.aws/credentials` 프로필
+3. boto3 기본 체인 (`default` 프로필 등)
+
+필요한 IAM 권한: EC2 (인스턴스·키페어·보안그룹·Elastic IP 생성/조회). 관리형 정책 `AmazonEC2FullAccess` 면 충분하다.
+
 ## 0. 로컬 준비 (한 번만)
 
 1. Python 3.11+ 와 의존성

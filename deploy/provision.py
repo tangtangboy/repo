@@ -31,7 +31,15 @@ SIGNAL_PATH = "/lake/signal"
 
 
 def aws_session() -> boto3.Session:
-    """AWS_PROFILE 환경변수가 있으면 그 프로필, 없으면 기본 자격증명 체인."""
+    """자격증명 우선순위: DEPLOY_AWS_ACCESS_KEY_ID/DEPLOY_AWS_SECRET_ACCESS_KEY 환경변수
+    (클라우드 세션 환경 설정용, 프록시의 AWS_* 더미 값과 이름이 겹치지 않게 별도 이름)
+    → AWS_PROFILE 프로필 → boto3 기본 체인."""
+    ak = os.environ.get("DEPLOY_AWS_ACCESS_KEY_ID")
+    sk = os.environ.get("DEPLOY_AWS_SECRET_ACCESS_KEY")
+    if ak and sk:
+        return boto3.Session(aws_access_key_id=ak, aws_secret_access_key=sk,
+                             aws_session_token=os.environ.get("DEPLOY_AWS_SESSION_TOKEN") or None,
+                             region_name=REGION)
     return boto3.Session(profile_name=os.environ.get("AWS_PROFILE") or None, region_name=REGION)
 
 
@@ -130,7 +138,8 @@ def main() -> None:
     sess = aws_session()
     ec2 = sess.client("ec2")
     ec2r = sess.resource("ec2")
-    print("aws profile:", os.environ.get("AWS_PROFILE") or "(default)", "| region:", REGION)
+    cred = "DEPLOY_AWS_* env" if os.environ.get("DEPLOY_AWS_ACCESS_KEY_ID") else (os.environ.get("AWS_PROFILE") or "(default profile)")
+    print("aws credentials:", cred, "| region:", REGION)
 
     deployer_ip = my_public_ip()
     print("this machine public IP:", deployer_ip)

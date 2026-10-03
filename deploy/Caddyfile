@@ -1,0 +1,30 @@
+# lake-executor 리버스 프록시. PUBLIC_HOST 는 /etc/caddy/env 에서 (setup-server.sh 가 기록).
+# 자동 HTTPS(Let's Encrypt). 외부는 443 만, 앱은 127.0.0.1:8787 만 듣는다.
+{$PUBLIC_HOST} {
+	# 앱의 max_body_bytes(65536) 보다 넉넉하지만 무제한은 아님
+	request_body {
+		max_size 256KB
+	}
+
+	reverse_proxy 127.0.0.1:8787 {
+		transport http {
+			dial_timeout 2s
+			response_header_timeout 10s
+		}
+	}
+
+	# 접근 로그: 관리 토큰·서명 헤더는 기록하지 않는다
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+		format filter {
+			wrap json
+			fields {
+				request>headers>X-Admin-Token delete
+				request>headers>X-Signature delete
+			}
+		}
+	}
+}

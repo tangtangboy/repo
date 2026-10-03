@@ -1,0 +1,26 @@
+[Unit]
+Description=lake-executor (lake webhook -> Bybit executor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/lake-executor
+ExecStart=/home/ubuntu/lake-executor/.venv/bin/python -m lake_executor serve
+Restart=always
+RestartSec=5
+# SIGTERM -> 정상 종료 (main.serve 가 처리). 체결 수집 중일 수 있으니 여유를 둔다.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+# stdout/stderr -> journald (journalctl -u lake-executor -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

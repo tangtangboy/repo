@@ -68,6 +68,32 @@ python -m pytest -q                                  # 네트워크 없이 전�
 `config.json` 의 `"test": {"simulate_fills": true}` 로 두면 TEST 신호가 계정마다 하나씩 만든 `PaperExchange` 로 체결되어
 회신·스냅샷 흐름까지 확인할 수 있다 (실거래소 호출 없음). `false` 면 TEST 는 **기록 전용**(`acknowledged` 회신 하나만).
 
+## 실매매 테스트 (내 거래소 키로 신호 한 건 넣어보기)
+
+목표: 내 서버(또는 PC)에서 `serve` 를 띄우고, 예시 신호 파일을 **서명해서 바로 쏴서** 실제 주문이 들어가는지 본다.
+
+```bash
+cp config.example.json config.json       # live.enabled 를 true 로, 쓸 계정만 enabled: true
+cp .env.example .env                     # BYBIT_API_KEY/SECRET (+ OKX_*, TOOBIT_*) 와
+                                         # LAKE_SIGNAL_SECRET_LIVE (아무 32자 이상 문자열, 발신기와 같은 값) 입력
+python -m lake_executor check            # 잔고·계약 정보 읽기. 여기서 실패하면 키/IP 화이트리스트 문제
+python -m lake_executor serve            # 터미널 1
+
+# 터미널 2 — tools/signals/ 의 예시를 순서대로 (ts/expires_at_ms/서명은 fire 가 채움)
+python -m lake_executor fire --mode live --file tools/signals/1_entry_long.json          # 롱 진입 0.001 BTC
+python -m lake_executor fire --mode live --file tools/signals/3_protect_long.json        # 손절/익절 가격 설정·변경
+python -m lake_executor fire --mode live --file tools/signals/4_partial_exit_long.json   # 롱 일부 익절
+python -m lake_executor fire --mode live --file tools/signals/5_full_exit_long.json      # 롱 전량 종료
+python -m lake_executor fire --mode live --file tools/signals/6_entry_short.json         # 숏 진입
+python -m lake_executor fire --mode live --file tools/signals/7_full_exit_short.json     # 숏 종료
+```
+
+- 응답 `202` 는 접수. 실제 체결은 서버 로그, `GET /state`(헤더 `X-Admin-Token`), 거래소 앱에서 확인한다.
+- 같은 `event_id` 를 다시 보내면 200 duplicate 로 **재실행되지 않는다**. 다시 돌리려면 `--event-id auto --position-id pos-L2` 처럼 새 ID 를 주거나 파일의 `position_id`/`event_sequence` 를 바꾼다.
+- `--qty 0.002` 로 수량만 바꿔 보낼 수 있다. `--mode test` 로 보내면 기록만 하고 주문하지 않는다(`test.simulate_fills=true` 면 모의 체결).
+- 거래소 키는 서버 공인 IP(EC2 면 Elastic IP, PC 면 집 IP)로 화이트리스트해야 한다.
+- 발신기(내 AWS 신호 서버)는 `tools/send_signal_example.sh` 또는 `lake_executor/auth.py` 의 서명 방식 그대로 보내면 된다.
+
 ## 계정 목록과 라우팅 (v0.2)
 
 `config.json` 의 `accounts[]` 가 실행 대상이다. **`accounts` 키가 없으면 v0.1 과 동일**하게 최상위

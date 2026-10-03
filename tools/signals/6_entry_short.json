@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "strategy_name": "my-signal",
+  "strategy": "basic",
+  "mode": "live",
+  "event_id": "pos-S1-entry",
+  "event_sequence": 1,
+  "ts": 0,
+  "expires_at_ms": 0,
+  "exchange": "Bybit",
+  "category": "linear",
+  "symbol": "BTCUSDT",
+  "position_id": "pos-S1",
+  "leg": "short",
+  "position_idx": 2,
+  "action": "entry",
+  "qty_btc": 0.001,
+  "expected_qty_btc_after": 0.001,
+  "reference_price": null,
+  "protection_revision": 1,
+  "stop_loss": null,
+  "take_profit": null
+}

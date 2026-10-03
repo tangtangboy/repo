@@ -499,28 +499,84 @@ def cmd_simulate(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # sign
 # --------------------------------------------------------------------------- #
-def cmd_sign(args: argparse.Namespace) -> int:
-    settings = _load_settings(args)
-    mode = args.mode
+def _stamp_signal(settings, body: dict, mode: str, ttl_s: float | None = None, *,
+                  event_id: str | None = None, position_id: str | None = None,
+                  seq: int | None = None, qty: float | None = None) -> tuple[bytes, dict, dict]:
+    """신호 dict 에 ts/expires_at_ms/mode(+선택 덮어쓰기)를 채우고 (raw_bytes, headers, body) 를 돌려준다.
+
+    event_id 가 'auto' 면 '<position_id>-<action>-<ts>' 로 생성한다(재전송 충돌 방지).
+    """
     secret = settings.secrets.signal_secret.get(mode)
     if not secret:
-        print(f"LAKE_SIGNAL_SECRET_{mode.upper()} is not set; cannot sign")
-        return 2
+        raise SystemExit(f"LAKE_SIGNAL_SECRET_{mode.upper()} is not set; cannot sign")
+    body = dict(body)
+    ts = now_ms()
+    body["ts"] = ts
+    body["mode"] = mode
+    if position_id:
+        body["position_id"] = position_id
+    if seq is not None:
+        body["event_sequence"] = int(seq)
+    if qty is not None and body.get("action") != "protection_update":
+        body["qty_btc"] = float(qty)
+    if event_id:
+        body["event_id"] = (f"{body.get('position_id','pos')}-{body.get('action','sig')}-{ts}"
+                            if event_id == "auto" else event_id)
+    ttl_ms = int((ttl_s if ttl_s is not None else SIM_EXPIRES_MS / 1000) * 1000)
+    exp = body.get("expires_at_ms")
+    if ttl_s is not None or not isinstance(exp, int) or isinstance(exp, bool) or exp < ts:
+        body["expires_at_ms"] = ts + ttl_ms
+    raw = canonical_json(body)
+    headers = auth.headers_for(raw, secret, ts)
+    return raw, headers, body
+
+
+def cmd_fire(args: argparse.Namespace) -> int:
+    """신호 파일에 서명해서 서버로 바로 전송한다 (수동 실매매 테스트용)."""
+    import httpx
+
+    settings = _load_settings(args)
     with open(args.file, "r", encoding="utf-8") as f:
         body = json.load(f)
     if not isinstance(body, dict):
         print("signal file must contain a JSON object")
         return 2
-    ts = now_ms()
-    body["ts"] = ts
+    raw, headers, body = _stamp_signal(settings, body, args.mode, args.ttl, event_id=args.event_id,
+                                       position_id=args.position_id, seq=args.seq, qty=args.qty)
+    url = args.url or (args.base_url.rstrip("/") + settings.signal_path)
+    print(f"fire -> {url}")
+    print(f"  mode={body['mode']} action={body.get('action')} position_id={body.get('position_id')} "
+          f"event_id={body.get('event_id')} seq={body.get('event_sequence')} leg={body.get('leg')} "
+          f"idx={body.get('position_idx')} qty_btc={body.get('qty_btc')} sl={body.get('stop_loss')} tp={body.get('take_profit')}")
+    if body["mode"] == "live" and not args.yes:
+        ans = input("  LIVE 신호입니다. 실제 주문이 나갑니다. 계속할까요? [y/N] ").strip().lower()
+        if ans != "y":
+            print("  취소")
+            return 1
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            r = client.post(url, content=raw, headers=headers)
+    except httpx.HTTPError as e:
+        print(f"  ERROR {type(e).__name__}: {str(e)[:200]}")
+        return 1
+    print(f"  -> {r.status_code} {r.text.strip()[:300]}")
+    if r.status_code in (200, 202):
+        print("  접수됨. 실행 결과는 서버 로그 / GET /state (X-Admin-Token) / 거래소 앱에서 확인하세요.")
+    return 0 if r.status_code < 300 else 1
+
+
+def cmd_sign(args: argparse.Namespace) -> int:
+    settings = _load_settings(args)
+    mode = args.mode
+    with open(args.file, "r", encoding="utf-8") as f:
+        body = json.load(f)
+    if not isinstance(body, dict):
+        print("signal file must contain a JSON object")
+        return 2
     if body.get("mode") != mode:
         print(f"note: body.mode set to '{mode}' (was {body.get('mode')!r})")
-        body["mode"] = mode
-    exp = body.get("expires_at_ms")
-    if not isinstance(exp, int) or isinstance(exp, bool) or exp < ts:
-        body["expires_at_ms"] = ts + SIM_EXPIRES_MS
-    raw = canonical_json(body)
-    headers = auth.headers_for(raw, secret, ts)
+    raw, headers, body = _stamp_signal(settings, body, mode, args.ttl, event_id=args.event_id,
+                                       position_id=args.position_id, seq=args.seq, qty=args.qty)
 
     out_path = args.out or (os.path.splitext(args.file)[0] + ".signed.json")
     with open(out_path, "wb") as f:
@@ -586,6 +642,26 @@ def build_parser() -> argparse.ArgumentParser:
     gp.add_argument("--out", default=None, help="where to write the signed body (default: <file>.signed.json)")
     gp.add_argument("--url", default=None, help="URL for the curl example (default: http://127.0.0.1:8787<signal_path>)")
     gp.set_defaults(func=cmd_sign)
+    for _p in (gp,):
+        _p.add_argument("--ttl", type=float, default=None, help="expires_at_ms = now + ttl seconds (default 15)")
+        _p.add_argument("--event-id", default=None, help="override event_id ('auto' = <position_id>-<action>-<ts>)")
+        _p.add_argument("--position-id", default=None)
+        _p.add_argument("--seq", type=int, default=None, help="override event_sequence")
+        _p.add_argument("--qty", type=float, default=None, help="override qty_btc")
+
+    fp = sub.add_parser("fire", help="sign a signal file and POST it to a running server (manual live/test firing)")
+    _add_config_args(fp, suppress=True)
+    fp.add_argument("--file", required=True, help="signal JSON file (see tools/signals/)")
+    fp.add_argument("--mode", choices=MODES, required=True)
+    fp.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    fp.add_argument("--url", default=None, help="full URL (overrides --base-url + signal_path)")
+    fp.add_argument("--ttl", type=float, default=None, help="expires_at_ms = now + ttl seconds (default 15)")
+    fp.add_argument("--event-id", default=None, help="override event_id ('auto' = <position_id>-<action>-<ts>)")
+    fp.add_argument("--position-id", default=None)
+    fp.add_argument("--seq", type=int, default=None, help="override event_sequence")
+    fp.add_argument("--qty", type=float, default=None, help="override qty_btc")
+    fp.add_argument("-y", "--yes", action="store_true", help="skip the LIVE confirmation prompt")
+    fp.set_defaults(func=cmd_fire)
     return p
 
 

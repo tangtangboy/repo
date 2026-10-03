@@ -75,6 +75,9 @@ class ReasonCode(str, Enum):
     TAKE_PROFIT_TRIGGERED = "TAKE_PROFIT_TRIGGERED"
     TEST_RECORD_ONLY = "TEST_RECORD_ONLY"
     QTY_MISMATCH = "QTY_MISMATCH"
+    EXPIRED = "EXPIRED"                       # 실행 시점에 expires_at_ms 경과 (접수 후 지연)
+    OPPOSING_LEG = "OPPOSING_LEG"             # 단방향(idx 0) 에서 반대 방향 lot 이 이미 열려 있음
+    PROTECTION_FAILED = "PROTECTION_FAILED"   # 체결은 됐으나 보호주문 생성/취소 실패 (reconcile 이 재시도)
 
 
 def _finite_pos(v, name: str):

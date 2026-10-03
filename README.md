@@ -70,6 +70,9 @@ python -m pytest -q                                  # 네트워크 없이 전�
 | 신호 `mode: test` | 실거래소를 절대 건드리지 않음. 기록 전용 또는 PaperExchange 시뮬레이션 |
 | 신호 `mode: live` | `live.enabled=true` **그리고** 실제 Bybit 키 **그리고** `LAKE_SIGNAL_SECRET_LIVE` 가 있어야 실행. 아니면 접수(202)는 하되 `rejected/LIVE_DISABLED` 회신 |
 | `state/HALT` 파일 | 새 신호를 전부 `rejected/OPERATOR_HALT`. 거래소의 기존 보호주문(SL/TP)은 그대로 유지. 스냅샷·회신은 계속 |
+| 실행 시점 만료 | 접수 뒤 지연돼 `expires_at_ms` 가 지난 신호는 `rejected/EXPIRED` (재시작·백로그·HALT 해제 뒤 오래된 신호를 현재가로 실행하지 않음) |
+| 보호주문 자가 복구 | 체결 뒤 SL/TP 생성이 실패해도 신호는 체결대로 종결(note `PROTECTION_FAILED` + 알림)하고, 30초 대사가 빠진 보호주문을 다시 만든다. 트리거가 이미 지난 보호가격은 즉시 reduceOnly 시장가로 실행(`auto:sl`/`auto:tp`). `/healthz` 의 `protection_missing` 로 확인 |
+| 불명 주문 재확인 | `EXCHANGE_TIMEOUT`/조회 실패로 끝난 시장가 주문은 대사가 거래소에서 종결될 때까지 재확인해 늦은 체결을 lot·회신에 반영 |
 | 불일치 플래그 (`RECONCILE_REQUIRED`) | 거래소 포지션 ≠ 우리 lot 합계이면 해당 mode 의 `entry/add` 거부, 청산류는 허용, **스냅샷 전송 중단**(`complete:true` 를 보낼 수 없으므로) |
 | 수량 가드 | `qtyStep` 내림 → `min_qty` 미만 `QTY_BELOW_MIN`, 주문 1건 > `guards.max_order_qty_btc` → `QTY_LIMIT`, 레그 합계 > `guards.max_leg_qty_btc` → `LEG_LIMIT` |
 | 슬리피지 가드 (entry/add) | `|last − reference_price| / reference_price` > `guards.max_entry_slippage_pct` % → `SLIPPAGE_GUARD` (reference_price 가 null 이면 생략) |
@@ -78,7 +81,9 @@ python -m pytest -q                                  # 네트워크 없이 전�
 
 시크릿은 방향·모드별로 분리한다: 수신 검증 `LAKE_SIGNAL_SECRET_{TEST,LIVE}`, 회신 서명 `LAKE_REPORT_SECRET_{TEST,LIVE}`,
 회신 URL `LAKE_REPORT_URL_{TEST,LIVE}`. 해당 모드의 수신 키가 없으면 그 모드 신호는 **503**.
-회신 URL/키가 없으면 회신은 `unsent` 로 저장만 된다.
+회신 URL/키가 없으면 회신은 `unsent` 로 저장만 된다. `event_id` 는 mode 별로 유일하다(TEST 키로 LIVE event_id 를 선점할 수 없다).
+`ADMIN_TOKEN` 은 시크릿과 같이 32바이트 이상(`python -c "import secrets;print(secrets.token_urlsafe(32))"`)이어야 하고,
+배포에서는 `/state`·`/admin/*` 가 Caddy 에서 운영자 CIDR(기본 서버 로컬)로 제한된다.
 
 ## 배포
 

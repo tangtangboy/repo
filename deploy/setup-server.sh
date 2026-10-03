@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 새 Ubuntu 24.04 EC2 에서 1회 실행 (push.py 가 호출). 멱등: 다시 돌려도 안전.
-#   bash deploy/setup-server.sh [PUBLIC_HOST]
+#   bash deploy/setup-server.sh [PUBLIC_HOST] [ADMIN_ALLOW_CIDR]
 # PUBLIC_HOST 우선순위: 인자 > 환경변수 PUBLIC_HOST > 기존 /etc/caddy/env > <EIP를 -로 바꾼 값>.sslip.io
+# ADMIN_ALLOW_CIDR: /state, /admin/* 를 외부에서 허용할 운영자 CIDR (기본 127.0.0.1/32 = 외부 차단, 서버 로컬만)
 #
 # 하는 일
 #   1) python3-venv 설치, .venv 생성, requirements.txt 설치
@@ -40,6 +41,13 @@ if [ -z "$PUBLIC_HOST" ]; then
 fi
 echo ">> PUBLIC_HOST=$PUBLIC_HOST"
 
+ADMIN_ALLOW_CIDR="${2:-${ADMIN_ALLOW_CIDR:-}}"
+if [ -z "$ADMIN_ALLOW_CIDR" ] && [ -f "$CADDY_ENV" ]; then
+  ADMIN_ALLOW_CIDR="$(sed -n 's/^ADMIN_ALLOW_CIDR=//p' "$CADDY_ENV" | head -n1 || true)"
+fi
+ADMIN_ALLOW_CIDR="${ADMIN_ALLOW_CIDR:-127.0.0.1/32}"
+echo ">> ADMIN_ALLOW_CIDR=$ADMIN_ALLOW_CIDR (/state, /admin/* reachable only from here)"
+
 # ---------- 1) python ----------
 echo ">> apt: python venv + base tools"
 sudo apt-get update -y -q
@@ -71,7 +79,7 @@ echo ">> caddy: $(caddy version | head -n1)"
 
 # ---------- 3) /etc/caddy/env + drop-in ----------
 sudo mkdir -p /etc/caddy /var/log/caddy
-printf 'PUBLIC_HOST=%s\n' "$PUBLIC_HOST" | sudo tee "$CADDY_ENV" >/dev/null
+printf 'PUBLIC_HOST=%s\nADMIN_ALLOW_CIDR=%s\n' "$PUBLIC_HOST" "$ADMIN_ALLOW_CIDR" | sudo tee "$CADDY_ENV" >/dev/null
 sudo chmod 644 "$CADDY_ENV"
 sudo mkdir -p /etc/systemd/system/caddy.service.d
 sudo tee /etc/systemd/system/caddy.service.d/10-env.conf >/dev/null <<'EOF'
@@ -84,7 +92,7 @@ sudo chown caddy:caddy /var/log/caddy 2>/dev/null || true
 sudo cp "$APP_DIR/deploy/Caddyfile" /etc/caddy/Caddyfile
 sudo chmod 644 /etc/caddy/Caddyfile
 echo ">> validating Caddyfile"
-PUBLIC_HOST="$PUBLIC_HOST" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+PUBLIC_HOST="$PUBLIC_HOST" ADMIN_ALLOW_CIDR="$ADMIN_ALLOW_CIDR" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
 sudo cp "$APP_DIR/deploy/lake-executor.service" /etc/systemd/system/lake-executor.service
 sudo chmod 644 /etc/systemd/system/lake-executor.service

@@ -1,6 +1,7 @@
 """최종 배포: 비밀값 업로드 → check → 서비스 기동 → 상태/로그 출력.
 
 1. lake_executor/ 소스 재업로드(서버 코드 동기화) + 로컬 .env, config.json 업로드 (SFTP, 셸 인자로 비밀 전달 안 함)
+   SSH 는 deploy/known_hosts 에 기록된 호스트 키만 신뢰한다 (첫 접속: 지문 확인 → --trust-new-host-key)
 2. chmod 600 .env config.json
 3. `python -m lake_executor check` (읽기 전용: 설정·키·Bybit 연결·회신 URL 확인; 주문 없음)
 4. 통과하면 `systemctl enable --now lake-executor` (+restart 로 새 코드 반영), caddy 재시작
@@ -13,37 +14,21 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import posixpath
 import sys
 
 import paramiko
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sshutil import add_trust_arg, connect, load_state  # noqa: E402  (호스트 키 고정 SSH)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-STATE_PATH = os.path.join(HERE, "aws_state.json")
 REMOTE = "/home/ubuntu/lake-executor"
 SERVICE = "lake-executor"
 SKIP_DIRS = {"__pycache__", ".pytest_cache"}
 SKIP_SUFFIXES = (".pyc", ".pyo", ".log", ".db", ".pem")
-
-
-def load_state() -> dict:
-    if not os.path.exists(STATE_PATH):
-        raise SystemExit("deploy/aws_state.json not found — run deploy/provision.py first")
-    with open(STATE_PATH, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_private_key(path: str):
-    last = None
-    for cls in (paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey):
-        try:
-            return cls.from_private_key_file(path)
-        except Exception as e:  # noqa: BLE001
-            last = e
-    raise SystemExit(f"cannot load private key {path}: {type(last).__name__}")
 
 
 def run(cli: paramiko.SSHClient, cmd: str, echo: bool = True) -> tuple[int, str]:
@@ -81,6 +66,7 @@ def main() -> None:
     ap.add_argument("--env", default=os.path.join(ROOT, ".env"), help="local .env to upload")
     ap.add_argument("--config", default=os.path.join(ROOT, "config.json"), help="local config.json to upload")
     ap.add_argument("--skip-check", action="store_true", help="start service even if check fails (not recommended)")
+    add_trust_arg(ap)
     args = ap.parse_args()
 
     for p in (args.env, args.config):
@@ -88,10 +74,7 @@ def main() -> None:
             raise SystemExit(f"missing {p} — copy from .env.example / config.example.json and fill it in")
 
     state = load_state()
-    cli = paramiko.SSHClient()
-    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    cli.connect(state["public_ip"], username=state["ssh_user"],
-                pkey=load_private_key(state["key_path"]), timeout=20)
+    cli = connect(state, trust_new=args.trust_new_host_key)   # known_hosts 대조; 첫 접속은 지문 확인 후 기록
     print("connected to", state["public_ip"])
     try:
         # 1+2: 소스 + 비밀값 업로드, 권한 잠금

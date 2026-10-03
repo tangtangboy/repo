@@ -183,11 +183,67 @@ def test_body_over_limit_is_413(client, store, settings):
 
 
 def test_body_at_limit_is_not_413(client):
-    """정확히 65536 바이트는 크기 때문에 거부되지 않는다 (서명 없음 → 401 로 떨어진다)."""
+    """정확히 65536 바이트는 크기 때문에 거부되지 않는다 (mode 없음 → 400 BAD_MODE 로 떨어진다)."""
     payload = b'{"pad":"' + b"x" * (65536 - len(b'{"pad":""}')) + b'"}'
     assert len(payload) == 65536
     r = client.post(SIGNAL_PATH, content=payload, headers={"Content-Type": "application/json"})
-    assert r.status_code != 413
+    assert r.status_code == 400 and r.json()["code"] == "BAD_MODE"
+
+
+def test_chunked_body_over_limit_is_413_without_buffering(client):
+    """Content-Length 없는 chunked 전송도 상한을 넘는 순간 413 (전체를 메모리에 올리지 않는다)."""
+    def gen():
+        for _ in range(8):
+            yield b"x" * 16384
+    r = client.post(SIGNAL_PATH, content=gen(), headers={"Content-Type": "application/json"})
+    assert r.status_code == 413
+
+
+def test_missing_content_type_is_415(client):
+    d = make_signal()
+    raw, headers = sign_body(d, TEST_SIGNAL_SECRET)
+    headers.pop("Content-Type", None)
+    r = client.post(SIGNAL_PATH, content=raw, headers=headers)
+    assert r.status_code == 415 and r.json()["code"] == "CONTENT_TYPE_NOT_JSON"
+
+
+def test_deeply_nested_json_is_400_not_500(client):
+    headers = sign_body({"ts": now_ms()}, TEST_SIGNAL_SECRET)[1]
+    r = client.post(SIGNAL_PATH, content=b"[" * 20000 + b"]" * 20000, headers=headers)
+    assert r.status_code == 400 and r.json()["error"] == "BAD_JSON"
+
+
+def test_non_integer_body_ts_is_timestamp_mismatch(client, store):
+    """본문 ts 가 문자열/실수면 pydantic 이 int 로 강제하더라도 X-Timestamp 대조를 건너뛰지 않는다."""
+    d = make_signal()
+    d["ts"] = str(d["ts"])
+    r = _post(client, d)
+    assert r.status_code == 401 and r.json()["code"] == "TIMESTAMP_MISMATCH"
+    assert store.get_signal(d["event_id"]) is None
+    d = make_signal()
+    d["ts"] = float(d["ts"])
+    assert _post(client, d).status_code == 401
+
+
+def test_invalid_event_id_is_not_echoed_in_prelogged_rejections(client, store):
+    d = make_signal(event_id="evil\nsignal accepted mode=live")
+    r = _post(client, d, secret="wrong-secret-0123456789abcdef-0123456789")
+    assert r.status_code == 401
+    assert r.json().get("event_id") is None
+    assert "evil" not in r.text
+
+
+def test_same_event_id_in_test_and_live_are_both_accepted(client, store):
+    """event_id 유일성은 mode 별: TEST 키 보유자가 LIVE event_id 를 선점(409)할 수 없다."""
+    d_test = make_signal(mode="test", event_id="shared-event-1", position_id="pos-shared")
+    d_live = make_signal(mode="live", event_id="shared-event-1", position_id="pos-shared")
+    assert _post(client, d_test).status_code == 202
+    assert _post(client, d_live, secret=LIVE_SIGNAL_SECRET).status_code == 202
+    assert store.get_signal("shared-event-1", "test")["mode"] == "test"
+    assert store.get_signal("shared-event-1", "live")["mode"] == "live"
+    # 각 모드 안에서는 여전히 중복/충돌 규칙이 적용된다
+    assert _post(client, d_test).status_code == 200
+    assert _post(client, dict(d_live, qty_btc=0.003, expected_qty_btc_after=0.003), secret=LIVE_SIGNAL_SECRET).status_code == 409
 
 
 def test_content_encoding_gzip_is_415(client, store):
@@ -231,12 +287,27 @@ def test_live_signal_with_live_secret_is_accepted_even_when_live_disabled(client
 
 
 def test_rejections_are_logged_without_raw_body(client, store):
-    d = make_signal()
-    _post(client, d, secret="wrong-secret-0123456789abcdef-0123456789")
+    """서명을 통과한 뒤의 거부(스키마 등)는 ingress_log 에 코드 + 본문 sha256 만 남는다."""
+    d = make_signal(extra_field="x")
+    assert _post(client, d).status_code == 400
     rows = store._q("SELECT * FROM ingress_log ORDER BY id DESC LIMIT 1")
-    assert rows and rows[0]["code"] == "BAD_SIGNATURE"
+    assert rows and rows[0]["code"] == "SCHEMA"
+    assert rows[0]["event_id"] == d["event_id"]
     assert rows[0]["body_sha256"] and len(rows[0]["body_sha256"]) == 64
     assert "raw_body" not in rows[0]
+
+
+def test_pre_auth_rejections_are_counted_not_stored(client, store):
+    """서명 전 거부(401/400 BAD_JSON/415/413)는 DB 에 쓰지 않고 메모리 카운터로만 센다 (무인증 폭주 방어)."""
+    before = store._q("SELECT COUNT(*) AS n FROM ingress_log")[0]["n"]
+    assert _post(client, make_signal(), secret="wrong-secret-0123456789abcdef-0123456789").status_code == 401
+    headers = sign_body({"ts": now_ms()}, TEST_SIGNAL_SECRET)[1]
+    assert client.post(SIGNAL_PATH, content=b"{not json", headers=headers).status_code == 400
+    assert _post(client, make_signal(), extra_headers={"Content-Encoding": "gzip"}).status_code == 415
+    assert store._q("SELECT COUNT(*) AS n FROM ingress_log")[0]["n"] == before
+    st = client.get("/state", headers={"X-Admin-Token": ADMIN_TOKEN}).json()
+    rej = st["ingress_rejections"]
+    assert rej.get("BAD_SIGNATURE", 0) >= 1 and rej.get("PARSE_ERROR", 0) >= 1 and rej.get("UNSUPPORTED_ENCODING", 0) >= 1
 
 
 def test_responses_never_expose_secrets(client):
@@ -255,13 +326,15 @@ def test_responses_never_expose_secrets(client):
 def test_healthz(client, settings, store):
     r = client.get("/healthz")
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "halted": False, "inconsistent": {"test": False, "live": False}}
+    assert r.json() == {"ok": True, "halted": False, "inconsistent": {"test": False, "live": False},
+                        "protection_missing": {"test": 0, "live": 0}}
     store.set_inconsistent("live", True, "x")
     os.makedirs(os.path.dirname(settings.halt_file), exist_ok=True)
     with open(settings.halt_file, "w") as f:
         f.write("halt\n")
     r = client.get("/healthz")
-    assert r.json() == {"ok": True, "halted": True, "inconsistent": {"test": False, "live": True}}
+    assert r.json() == {"ok": True, "halted": True, "inconsistent": {"test": False, "live": True},
+                        "protection_missing": {"test": 0, "live": 0}}
 
 
 # ---------------------------------------------------------------- admin
@@ -287,6 +360,21 @@ def test_admin_endpoints_require_correct_token(client, settings):
         assert client.post("/admin/resume", headers=h).status_code == 401
         assert client.post("/admin/reconcile?mode=test", headers=h).status_code == 401
     assert not os.path.exists(settings.halt_file)
+
+
+def test_admin_token_brute_force_is_throttled_per_ip(client):
+    from lake_executor import receiver as rmod
+    for _ in range(rmod.ADMIN_FAIL_LIMIT):
+        assert client.get("/state", headers={"X-Admin-Token": "guess"}).status_code == 401
+    # 창 안에서 한도를 넘긴 IP 는 올바른 토큰도 비교 없이 401
+    assert client.get("/state", headers={"X-Admin-Token": ADMIN_TOKEN}).status_code == 401
+
+
+def test_short_admin_token_is_rejected_by_config(settings_factory):
+    from lake_executor.config import ConfigError
+    import pytest
+    with pytest.raises(ConfigError):
+        settings_factory(env_overrides={"ADMIN_TOKEN": "1234"})
 
 
 def test_admin_halt_resume_state_reconcile(client, settings, store, alerts):

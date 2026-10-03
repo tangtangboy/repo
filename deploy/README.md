@@ -10,6 +10,7 @@ lake-executor 를 AWS EC2(서울, ap-northeast-2) 에 올려 24시간 돌리는 
 | `push.py` | 소스 업로드 + `setup-server.sh` 실행 (venv, 의존성, Caddy, systemd 유닛) |
 | `finalize.py` | `.env`/`config.json` 업로드(600) → `check` → 서비스 기동 → 로그 출력 |
 | `ssh_run.py` | 서버에서 명령 하나 실행 (상태 확인·HALT·로그) |
+| `sshutil.py` | 공용 SSH 연결: 호스트 키를 `deploy/known_hosts` 에 고정 (첫 접속 지문 확인, 이후 불일치 거부) |
 | `setup-server.sh` | 서버 쪽 1회 설정 스크립트 (push.py 가 호출, 재실행 안전) |
 | `Caddyfile` | `{$PUBLIC_HOST}` → `reverse_proxy 127.0.0.1:8787` |
 | `lake-executor.service` | systemd 유닛 (`User=ubuntu`, `Restart=always`) |
@@ -75,6 +76,12 @@ python deploy/push.py
   → `/etc/caddy/env` 에 `PUBLIC_HOST=<EIP를 -로 바꾼 값>.sslip.io` → Caddyfile·systemd 유닛 설치 → `daemon-reload` → caddy enable.
 - lake-executor 서비스는 **아직 시작하지 않는다** (비밀값이 없으므로).
 - 막 만든 인스턴스는 SSH 가 뜨는 데 30~60초 걸린다. "ssh not ready … waiting" 이 몇 번 찍히는 건 정상.
+- **첫 접속**에는 서버 호스트 키 지문이 출력되고 확인을 묻는다 (EC2 콘솔 > 인스턴스 > 모니터링 및 문제 해결 > 시스템 로그 가져오기
+  의 `ssh-keygen` 지문과 대조). 확인하면 `deploy/known_hosts` 에 기록되고 이후에는 그 키만 신뢰한다. 비대화형이면
+  `--trust-new-host-key` (또는 `LAKE_TRUST_NEW_HOST_KEY=1`). 인스턴스를 재생성해 키가 바뀌면 "HOST KEY MISMATCH" 로 거부된다
+  → `deploy/known_hosts` 의 해당 줄을 지우고 다시 확인한다. `.env` 를 SFTP 로 올리는 `finalize.py` 도 같은 규칙이다.
+- `/state`, `/admin/*` 는 Caddy 에서 기본적으로 서버 로컬(127.0.0.1/32)만 허용한다. 외부 운영 PC 에서 쓰려면
+  `python deploy/push.py --admin-cidr <PC공인IP>/32` (aws_state.json 에 기억된다).
 - 코드를 고친 뒤 다시 올릴 때도 `push.py` (또는 `finalize.py` — 패키지를 같이 올린다) 를 쓴다.
 
 ## 4. 비밀값 작성 (로컬)
@@ -84,7 +91,8 @@ copy .env.example .env
 copy config.example.json config.json
 ```
 - `.env`: `BYBIT_API_KEY/SECRET`, `LAKE_SIGNAL_SECRET_TEST/LIVE`(수신 검증, 32바이트 이상),
-  `LAKE_REPORT_SECRET_TEST/LIVE` + `LAKE_REPORT_URL_TEST/LIVE`(회신), `ADMIN_TOKEN`, (선택) 텔레그램.
+  `LAKE_REPORT_SECRET_TEST/LIVE` + `LAKE_REPORT_URL_TEST/LIVE`(회신), `ADMIN_TOKEN`(32바이트 이상,
+  `python -c "import secrets;print(secrets.token_urlsafe(32))"`), (선택) 텔레그램.
 - `config.json`: 처음엔 `"live": {"enabled": false}` 로 두고 TEST 모드부터. `"test": {"simulate_fills": true}` 로 하면
   TEST 신호를 PaperExchange 로 체결시켜 회신·스냅샷 흐름까지 확인할 수 있다 (실거래소 호출 없음).
 - 실거래 전환은 **lake 와 TEST 왕복이 끝난 뒤** `live.enabled=true` 로 바꾸고 다시 `finalize.py`.

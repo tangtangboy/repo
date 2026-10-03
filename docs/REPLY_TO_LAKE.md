@@ -39,11 +39,12 @@
 | **400** | `{"error":"BAD_JSON"\|"INVALID_SIGNAL","code":…,"fields":[…]}` | 파싱/스키마/의미 오류. `code`: `PARSE_ERROR`, `DUPLICATE_KEY`, `BAD_MODE`, `SCHEMA`(필드 경로만), `SYMBOL_MISMATCH`, `POSITION_MODE_MISMATCH` |
 | **401** | `{"error":"UNAUTHORIZED","code":…}` | `MISSING_SIGNATURE` / `MISSING_TIMESTAMP` / `BAD_TIMESTAMP` / `TIMESTAMP_SKEW` / `TIMESTAMP_MISMATCH` / `BAD_SIGNATURE` |
 | **413** | `{"error":"PAYLOAD_TOO_LARGE","max_bytes":65536}` | 본문 크기 초과 |
-| **415** | `{"error":"UNSUPPORTED_MEDIA_TYPE","code":…}` | JSON 이 아니거나 `Content-Encoding` 사용 |
+| **415** | `{"error":"UNSUPPORTED_MEDIA_TYPE","code":…}` | `Content-Type: application/json` 이 없거나 다름, 또는 `Content-Encoding` 사용 |
 | **503** | `{"error":"SECRET_NOT_CONFIGURED","mode":"…"}` | 그 모드의 수신 키가 우리 쪽에 미설정. 설정 후 재전송 가능 |
 | 500 / 502 | — | 우리 저장 장애 / 서비스 재시작 중. 재전송 정책(§7) 적용 |
 
-응답 본문에 시크릿·내부 예외 원문은 포함하지 않습니다. 거부 건은 코드와 본문 sha256 만 기록합니다.
+응답 본문에 시크릿·내부 예외 원문은 포함하지 않습니다. 거부 건은 코드와 본문 sha256 만 기록합니다(서명 전 거부는 횟수만).
+`event_id` 의 유일성은 **mode 별**입니다(TEST 와 LIVE 가 같은 event_id 를 써도 서로 충돌하지 않습니다).
 
 ## 4. 지원하는 동작 — 모두 지원합니다
 
@@ -53,7 +54,7 @@
 | `add` | 열린 lot 에 `qty_btc` 만큼 같은 방향 시장가 추가 → lot 수량·평균가 갱신 → 보호주문 수량 재설정 |
 | `partial_exit` | 열린 lot 에서 **명시 BTC 수량만** reduceOnly 시장가로 감소. lot 잔량 초과는 `rejected/QTY_EXCEEDS_LOT`. **전량 청산으로 변환하지 않음** |
 | `full_exit` | **그 lot 의 잔량만** reduceOnly 시장가 청산 → 보호주문 취소 → lot 종료. 다른 전략 몫·반대 레그는 건드리지 않음 |
-| `protection_update` | `protection_revision` 이 lot 의 현재 값보다 클 때만 적용(아니면 `rejected/STALE_PROTECTION_REVISION`). 기존 보호주문 전부 취소 → 새 `stop_loss`/`take_profit` 로 재생성 → `protection_updated` 회신 + 스냅샷 |
+| `protection_update` | `protection_revision` 이 lot 의 현재 값보다 클 때만 적용(아니면 `rejected/STALE_PROTECTION_REVISION`). 기존 보호주문 전부 취소 → 새 `stop_loss`/`take_profit` 로 재생성 → `protection_updated` 회신 + 스냅샷. 재생성이 거래소 사정으로 실패하면 `error/PROTECTION_FAILED` 를 보내고 우리 쪽 대사가 자동으로 다시 만듭니다 — 이때는 **같은 revision 재전송을 멱등 재시도로 받습니다** |
 
 - **전략별 수량 귀속(lot 원장)**: Bybit 는 같은 레그를 합산하지만, 우리는 `(mode, position_id)` 단위 lot 원장을 따로 가지고
   각 신호를 그 lot 에만 적용합니다. 30초마다 positionIdx 별 거래소 수량과 lot 합계를 대사합니다.
@@ -63,6 +64,11 @@
   가격에 lot 수량을 균등 분할(최소 주문 수량 미만 레벨은 건너뜀, 나머지는 마지막 레벨). `add`/`partial_exit` 뒤에는 같은
   revision 으로 수량만 재설정합니다.
 - 보호주문은 전부 **reduceOnly** 이며, 우리 봇은 lake 신호 또는 보호주문 트리거 외에는 포지션을 열거나 닫지 않습니다.
+  예외 하나: 보호가격이 **이미 지나 있어** 거래소가 조건부 주문을 받지 않으면(예: 롱 진입 직후 현재가가 SL 아래) 그 보호를
+  즉시 reduceOnly 시장가로 실행하고 §6 의 `auto:sl`/`auto:tp` 이벤트로 회신합니다(포지션을 보호 없이 두지 않기 위해).
+- 체결된 신호의 회신 상태는 체결이 결정합니다. 체결 뒤 보호주문 생성에 실패해도 같은 `event_id` 로 `rejected`/`error` 를
+  보내지 않고(이미 `filled` 를 보냈으므로), 직후 스냅샷에 `stop_loss:null` 로 드러낸 뒤 30초 대사가 다시 만듭니다.
+- 접수 뒤 실행이 늦어져 `expires_at_ms` 가 지난 신호(재시작·백로그)는 실행하지 않고 `rejected/EXPIRED` 로 회신합니다.
 
 ## 5. 회신 방식 (설명서 §4 수신 규격 그대로 구현)
 
@@ -83,9 +89,11 @@
 - **가명 ID**: `order_id` = `"o-" + sha256(실제 주문ID)[:24]`, `fill_id` = `"f-" + sha256(실제 체결ID)[:24]`. 같은 체결은 같은
   `fill_id` 로만 보고하며 중복 보고하지 않습니다. 계정 식별자는 보내지 않습니다.
 - **reason_code**(정리된 코드만, 거래소 원문 없음): `LIVE_DISABLED` `OPERATOR_HALT` `POSITION_MODE_MISMATCH` `POSITION_EXISTS`
-  `POSITION_NOT_FOUND` `QTY_EXCEEDS_LOT` `QTY_BELOW_MIN` `QTY_LIMIT` `LEG_LIMIT` `SLIPPAGE_GUARD` `STALE_PROTECTION_REVISION`
-  `RECONCILE_REQUIRED` `EXCHANGE_REJECTED` `EXCHANGE_ERROR` `EXCHANGE_TIMEOUT` `UNKNOWN_STATE` `STOP_LOSS_TRIGGERED`
-  `TAKE_PROFIT_TRIGGERED`.
+  `POSITION_NOT_FOUND` `POSITION_CLOSED` `OPPOSING_LEG` `QTY_EXCEEDS_LOT` `QTY_BELOW_MIN` `QTY_LIMIT` `LEG_LIMIT` `SLIPPAGE_GUARD`
+  `STALE_PROTECTION_REVISION` `RECONCILE_REQUIRED` `EXPIRED` `EXCHANGE_REJECTED` `EXCHANGE_ERROR` `EXCHANGE_TIMEOUT`
+  `PROTECTION_FAILED` `UNKNOWN_STATE` `STOP_LOSS_TRIGGERED` `TAKE_PROFIT_TRIGGERED`.
+- `EXCHANGE_TIMEOUT`(`error`) 뒤에 거래소에서 체결이 확인되면 같은 `event_id` 로 체결(`filled`) 회신이 **늦게** 나갈 수 있습니다
+  (주문을 잃어버리지 않기 위해). 그 뒤 스냅샷이 실제 잔량을 보여 줍니다.
 - lake 응답 처리: 202 → 전송 완료, 200 → duplicate 로 기록, 409 → `conflict` 로 두고 운영자 알림(자동 번호 덮어쓰기 없음),
   그 외 4xx → `failed` + 알림, 5xx/타임아웃 → 재시도(최대 3회, 2초×n 백오프, **같은 바이트·ID·sequence·ts 유지**, 생성 후 50초 안에서만).
   창을 넘기면 그 번호는 결번(`failed`)으로 남기고 알림 → 다음 완전 스냅샷으로 잔량 재확인(설명서 §5 "불일치" 처리와 일치).
@@ -95,11 +103,13 @@
 보호주문이 거래소에서 자체 트리거되면 lake 의 `event_id` 가 없습니다. 아래 **합성 event_id** 로 execution 회신을 보내겠습니다
 (ID 패턴 `^[A-Za-z0-9_.:-]{1,128}$` 만족):
 
-- 손절: **`auto:sl:<position_id>:<protection_revision>`**
-- 익절(i 번째 레벨, 0부터): **`auto:tp:<position_id>:<protection_revision>:<i>`**
-- `action` = 잔량이 남으면 `partial_exit`, 0 이 되면 `full_exit`; `reason_code` = `STOP_LOSS_TRIGGERED` / `TAKE_PROFIT_TRIGGERED`;
-  체결마다 `partially_filled`/`filled` 회신 → 스냅샷. 같은 revision 안에서 같은 보호주문이 여러 번 부분 체결되면 같은 event_id 로
-  후속 보고합니다(설명서 "같은 event_id 의 후속 보고는 같은 포지션·전략·방향·동작 유지" 준수).
+- 손절: **`auto:sl:<position_id>:<protection_revision>:L<lot_opened_at_ms>`**
+- 익절(i 번째 레벨, 0부터): **`auto:tp:<position_id>:<protection_revision>:<i>:L<lot_opened_at_ms>`**
+- `L<lot_opened_at_ms>` 는 우리 쪽 lot 인스턴스(해당 position_id 가 열린 Unix ms) 입니다. 같은 `position_id` 를 닫았다가 다시 열어
+  같은 revision 으로 다시 손절되더라도 이전 이벤트와 ID 가 겹치지 않게 하기 위한 것입니다(파싱하지 않고 식별자로만 쓰시면 됩니다).
+- `action` = 잔량이 남으면 `partial_exit`, 0 이 되면 `full_exit` — **첫 보고에서 정해진 값을 그 event_id 의 후속 보고에서도 유지**합니다;
+  `reason_code` = `STOP_LOSS_TRIGGERED` / `TAKE_PROFIT_TRIGGERED`; 체결마다 `partially_filled`/`filled` 회신 → 스냅샷. 같은 revision 안에서
+  같은 보호주문이 여러 번 부분 체결되면 같은 event_id 로 후속 보고합니다(설명서 "같은 event_id 의 후속 보고는 같은 포지션·전략·방향·동작 유지" 준수).
 - `position_id` 가 매우 길어 128자를 넘으면 `sha256(position_id)[:24]` 로 축약합니다.
 
 lake 대시보드가 이 형식을 자기 신호와 구분해 표시할 수 있는지 확인 부탁드립니다.
@@ -111,7 +121,8 @@ lake 대시보드가 이 형식을 자기 신호와 구분해 표시할 수 있�
    교체(rotation) 시각을 양쪽이 맞춰 동시에 적용.
 2. **회신 URL**: 공개 HTTPS `LAKE_REPORT_URL_TEST` / `LAKE_REPORT_URL_LIVE` 두 개(같아도 됨). 우리 발신 IP(고정)를 알려드릴 수 있습니다.
 3. **유효시간 정책**: 예시의 `expires_at_ms = ts + 15s` 는 수용 가능. 단 네트워크 재전송을 고려해 **15~30초** 권장.
-   만료(410)는 재전송하지 말고 **새 event_id·sequence** 로 새 판단 신호를 보내주세요. 우리는 접수 시에만 만료를 검사하고,
+   만료(410)는 재전송하지 말고 **새 event_id·sequence** 로 새 판단 신호를 보내주세요. 만료는 접수 시(410)와 **실행 시점**
+   (접수 뒤 지연되면 `rejected/EXPIRED` 회신) 두 번 검사하므로, 오래된 신호가 현재가로 실행되는 일은 없습니다.
    접수된 신호는 FIFO 로 실행하므로 lake 측 발신 큐가 밀리지 않게 해주세요.
 4. **재시도 정책(lake → 우리)**: 비2xx/타임아웃 시 **같은 바이트·같은 event_id·같은 ts** 로 60초 서명 창 안에서 최대 2~3회
    재전송(간격 0.5~2초) 제안. 같은 바이트면 200 duplicate 로 안전합니다. ts 만 바꾸면 409 `EVENT_ID_CONFLICT` 가 납니다.

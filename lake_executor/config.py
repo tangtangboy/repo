@@ -170,5 +170,8 @@ def validate(s: Settings) -> None:
     for m, v in list(s.secrets.signal_secret.items()) + list(s.secrets.report_secret.items()):
         if len(v.encode("utf-8")) < 32:
             raise ConfigError(f"secret for {m} must be at least 32 bytes")
+    # 관리 엔드포인트 토큰도 HMAC 시크릿과 같은 최소 길이 (무차별 대입 방지). 생성: python -c "import secrets;print(secrets.token_urlsafe(32))"
+    if s.secrets.admin_token and len(s.secrets.admin_token.encode("utf-8")) < 32:
+        raise ConfigError("ADMIN_TOKEN must be at least 32 bytes (generate with secrets.token_urlsafe(32))")
     if s.protection_trigger_by not in ("MarkPrice", "LastPrice", "IndexPrice"):
         raise ConfigError("guards.protection_trigger_by must be MarkPrice | LastPrice | IndexPrice")

@@ -8,6 +8,8 @@ setup-server.sh: venv + 의존성, Caddy(공식 apt 저장소) 설치, /etc/cadd
     python deploy/push.py                       # PUBLIC_HOST = aws_state.json 의 public_host(기본 sslip.io)
     python deploy/push.py --host hook.example.com   # 직접 도메인 사용 (DNS A 레코드 → Elastic IP 먼저)
     python deploy/push.py --no-setup            # 파일만 올리고 setup-server.sh 는 생략
+    python deploy/push.py --admin-cidr 1.2.3.4/32   # /state, /admin/* 를 외부에서 쓸 운영자 IP (기본: 서버 로컬만)
+첫 접속은 호스트 키 지문을 보여 주고 확인을 받아 deploy/known_hosts 에 기록한다 (--trust-new-host-key 로 생략 가능).
 """
 from __future__ import annotations
 
@@ -16,9 +18,11 @@ import json
 import os
 import posixpath
 import sys
-import time
 
 import paramiko
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sshutil import add_trust_arg, connect as _ssh_connect, load_state  # noqa: E402  (호스트 키 고정 SSH)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -43,36 +47,9 @@ def is_secret_file(name: str) -> bool:
     return name.startswith(".env") or name in SECRET_NAMES or name.endswith(".pem")
 
 
-def load_state() -> dict:
-    if not os.path.exists(STATE_PATH):
-        raise SystemExit("deploy/aws_state.json not found — run deploy/provision.py first")
-    with open(STATE_PATH, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_private_key(path: str):
-    last = None
-    for cls in (paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey):
-        try:
-            return cls.from_private_key_file(path)
-        except Exception as e:  # noqa: BLE001
-            last = e
-    raise SystemExit(f"cannot load private key {path}: {type(last).__name__}")
-
-
-def connect(state: dict, retries: int = 30, delay: int = 10) -> paramiko.SSHClient:
-    """막 띄운 인스턴스는 SSH 가 뜰 때까지 시간이 걸리므로 재시도한다."""
-    key = load_private_key(state["key_path"])
-    cli = paramiko.SSHClient()
-    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    for i in range(retries):
-        try:
-            cli.connect(state["public_ip"], username=state["ssh_user"], pkey=key, timeout=15)
-            return cli
-        except Exception as e:  # noqa: BLE001
-            print(f"  ssh not ready ({i + 1}/{retries}): {type(e).__name__}; waiting {delay}s")
-            time.sleep(delay)
-    raise SystemExit("could not SSH to host")
+def connect(state: dict, retries: int = 30, delay: int = 10, trust_new: bool = False) -> paramiko.SSHClient:
+    """막 띄운 인스턴스는 SSH 가 뜰 때까지 시간이 걸리므로 재시도한다. 호스트 키는 deploy/known_hosts 로 고정."""
+    return _ssh_connect(state, trust_new=trust_new, retries=retries, delay=delay, timeout=15)
 
 
 def run(cli: paramiko.SSHClient, cmd: str, echo: bool = True) -> tuple[int, str, str]:
@@ -137,6 +114,9 @@ def main() -> None:
     ap.add_argument("--host", default=None,
                     help="PUBLIC_HOST for Caddy (default: aws_state.json public_host, i.e. <eip>.sslip.io)")
     ap.add_argument("--no-setup", action="store_true", help="upload only; do not run setup-server.sh")
+    ap.add_argument("--admin-cidr", default=None,
+                    help="CIDR allowed to reach /state and /admin/* through Caddy (default 127.0.0.1/32 = server only)")
+    add_trust_arg(ap)
     args = ap.parse_args()
 
     state = load_state()
@@ -144,7 +124,7 @@ def main() -> None:
         or state["public_ip"].replace(".", "-") + ".sslip.io"
 
     print(f"connecting to {state['ssh_user']}@{state['public_ip']} ...")
-    cli = connect(state)
+    cli = connect(state, trust_new=args.trust_new_host_key)
     print("connected.")
     try:
         run(cli, f"mkdir -p {REMOTE}/deploy {REMOTE}/state")
@@ -158,17 +138,24 @@ def main() -> None:
             print("\n==== PUSH DONE (upload only) ====")
             return
 
-        print(f"\n--- setup-server.sh (PUBLIC_HOST={public_host}) ---")
-        code, _, _ = run(cli, f"cd {REMOTE} && bash deploy/setup-server.sh '{public_host}'")
+        admin_cidr = args.admin_cidr or os.environ.get("ADMIN_ALLOW_CIDR") or state.get("admin_allow_cidr") or ""
+        print(f"\n--- setup-server.sh (PUBLIC_HOST={public_host} ADMIN_ALLOW_CIDR={admin_cidr or '127.0.0.1/32'}) ---")
+        code, _, _ = run(cli, f"cd {REMOTE} && bash deploy/setup-server.sh '{public_host}' '{admin_cidr}'")
         if code != 0:
             print("\n!! setup-server.sh failed (exit", code, ")")
             sys.exit(code)
 
+        changed = False
         if args.host and state.get("public_host") != args.host:
             state["public_host"] = args.host
+            changed = True
+            print("aws_state.json public_host ->", args.host)
+        if admin_cidr and state.get("admin_allow_cidr") != admin_cidr:
+            state["admin_allow_cidr"] = admin_cidr
+            changed = True
+        if changed:
             with open(STATE_PATH, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2)
-            print("aws_state.json public_host ->", args.host)
 
         print("\n==== PUSH DONE ====")
         print("host        :", state["public_ip"])

@@ -379,9 +379,16 @@ class BybitExchange(ExchangeBase):
         }
 
     def get_order(self, order_link_id: str) -> dict | None:
+        """열린 주문(일반 → 조건부 StopOrder) → 주문 이력 순으로 조회. 셋 다 없을 때만 None.
+        (v5 realtime 은 orderFilter 기본값이 일반 주문이라 조건부 보호주문은 StopOrder 로 한 번 더 본다.)"""
         r = self._call("get_open_orders", self.http.get_open_orders, read=True,
                        category=self.category, symbol=self.symbol, orderLinkId=order_link_id)
         lst = [o for o in _result_list(r) if o.get("orderLinkId") == order_link_id]
+        if not lst:
+            r = self._call("get_open_orders", self.http.get_open_orders, read=True,
+                           category=self.category, symbol=self.symbol, orderLinkId=order_link_id,
+                           orderFilter="StopOrder")
+            lst = [o for o in _result_list(r) if o.get("orderLinkId") == order_link_id]
         if not lst:
             r = self._call("get_order_history", self.http.get_order_history, read=True,
                            category=self.category, symbol=self.symbol, orderLinkId=order_link_id)

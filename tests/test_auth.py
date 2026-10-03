@@ -14,8 +14,11 @@ TS = 1791024000000
 SKEW = 60000
 
 
-def _verify(raw=BODY, sig=None, ts_header=str(TS), body_ts=TS, secret=SECRET, now=TS + 1000, skew=SKEW):
-    if sig is None:
+_AUTO = object()  # sig 기본값: 올바른 서명을 계산
+
+
+def _verify(raw=BODY, sig=_AUTO, ts_header=str(TS), body_ts=TS, secret=SECRET, now=TS + 1000, skew=SKEW):
+    if sig is _AUTO:
         sig = auth.sign(raw, secret)
     return auth.verify(raw, sig, ts_header, body_ts, secret, now, skew)
 

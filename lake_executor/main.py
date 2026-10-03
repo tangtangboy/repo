@@ -28,6 +28,8 @@ log = logging.getLogger("lake_executor.main")
 
 MODES = ("test", "live")
 DEFAULT_BASE_URL = "http://127.0.0.1:8787"
+DEFAULT_CONFIG_PATH = "config.json"
+DEFAULT_ENV_PATH = ".env"
 SIM_EXPIRES_MS = 15_000          # 계약 예시: 신호 만료 15초
 SIM_DEFAULT_QTY = 0.002
 THREAD_JOIN_TIMEOUT_S = 15.0
@@ -67,22 +69,28 @@ def _exchanges_for(settings) -> dict[str, Any]:
 # serve
 # --------------------------------------------------------------------------- #
 def _snapshot_loop(settings, executor, exchanges: dict[str, Any], stop_event: threading.Event) -> None:
-    """모드별 snapshot_interval_ms 마다 reconcile → reporter.snapshot (executor.snapshot_now)."""
+    """모드별 snapshot_interval_ms 마다 reconcile → reporter.snapshot (executor.snapshot_now).
+    다음 예정 시각은 호출이 **끝난 뒤** 잡는다: 실행기 락 대기/거래소 지연으로 호출이 길어져도 다음 스냅샷이
+    바로 이어져 lake 의 신선도 창(90초) 안에서 간격이 두 배로 벌어지지 않는다."""
     interval_ms = max(1000, int(getattr(settings, "snapshot_interval_ms", 30000)))
     next_at = {m: now_ms() + 2000 for m in MODES}  # 기동 직후 2초 뒤 첫 스냅샷
     log.info("snapshot loop started (interval=%sms)", interval_ms)
     while not stop_event.is_set():
-        now = now_ms()
         for mode in MODES:
-            if exchanges.get(mode) is None or now < next_at[mode]:
+            if exchanges.get(mode) is None or now_ms() < next_at[mode]:
                 continue
-            next_at[mode] = now + interval_ms
+            started = now_ms()
             try:
                 res = executor.snapshot_now(mode)
                 if res is None:
                     log.warning("snapshot %s skipped (reconcile not consistent)", mode)
             except Exception as e:  # noqa: BLE001 - 루프는 죽지 않는다
                 log.exception("snapshot %s failed: %s", mode, type(e).__name__)
+            finished = now_ms()
+            if finished - started > interval_ms // 2:
+                log.warning("snapshot %s took %dms (lock/exchange contention)", mode, finished - started)
+            # 호출에 걸린 시간만큼 다음 슬롯을 당긴다 (최소 1초 뒤)
+            next_at[mode] = max(finished + 1000, started + interval_ms)
         stop_event.wait(SNAPSHOT_TICK_S)
     log.info("snapshot loop stopped")
 
@@ -399,20 +407,31 @@ def cmd_sign(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # argparse
 # --------------------------------------------------------------------------- #
+def _add_config_args(p: argparse.ArgumentParser, *, suppress: bool) -> None:
+    """--config/--env 는 서브커맨드 앞뒤 어디에 와도 된다 (`check --config x` / `--config x check`).
+    서브파서 쪽은 SUPPRESS 기본값이라 주어졌을 때만 전역 값을 덮어쓴다."""
+    p.add_argument("--config", default=argparse.SUPPRESS if suppress else DEFAULT_CONFIG_PATH,
+                   help=f"config.json path (default: {DEFAULT_CONFIG_PATH})")
+    p.add_argument("--env", default=argparse.SUPPRESS if suppress else DEFAULT_ENV_PATH,
+                   help=f".env path with secrets (default: {DEFAULT_ENV_PATH})")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m lake_executor",
                                 description="lake-executor: lake webhook -> Bybit executor")
-    p.add_argument("--config", default="config.json", help="config.json path (default: config.json)")
-    p.add_argument("--env", default=".env", help=".env path with secrets (default: .env)")
+    _add_config_args(p, suppress=False)
     sub = p.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("serve", help="run receiver + executor + reporter")
+    _add_config_args(sp, suppress=True)
     sp.set_defaults(func=cmd_serve)
 
     cp = sub.add_parser("check", help="verify config, keys and read-only Bybit connectivity (no orders)")
+    _add_config_args(cp, suppress=True)
     cp.set_defaults(func=cmd_check)
 
     mp = sub.add_parser("simulate", help="send signed TEST-mode synthetic signals to a running server")
+    _add_config_args(mp, suppress=True)
     mp.add_argument("--base-url", default=DEFAULT_BASE_URL)
     mp.add_argument("--qty", type=float, default=SIM_DEFAULT_QTY, help="qty_btc per step (default 0.002)")
     mp.add_argument("--leg", choices=("long", "short"), default="long")
@@ -424,6 +443,7 @@ def build_parser() -> argparse.ArgumentParser:
     mp.set_defaults(func=cmd_simulate)
 
     gp = sub.add_parser("sign", help="stamp ts into a signal file and print signature headers + curl example")
+    _add_config_args(gp, suppress=True)
     gp.add_argument("--file", required=True, help="signal JSON file")
     gp.add_argument("--mode", choices=MODES, required=True)
     gp.add_argument("--out", default=None, help="where to write the signed body (default: <file>.signed.json)")

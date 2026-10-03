@@ -37,7 +37,7 @@ LIVE_SIGNAL_SECRET = "live-signal-secret-0123456789abcdef-0123456789"
 TEST_REPORT_SECRET = "test-report-secret-0123456789abcdef-0123456789"
 LIVE_REPORT_SECRET = "live-report-secret-0123456789abcdef-0123456789"
 REPORT_URL_TEST = "http://lake.test/report"
-ADMIN_TOKEN = "admin-token-for-tests-only-0001"
+ADMIN_TOKEN = "admin-token-for-tests-only-0123456789abcdef"
 PAPER_PRICE = 86000.0
 SIGNAL_PATH = "/lake/signal"
 

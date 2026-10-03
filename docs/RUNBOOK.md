@@ -22,8 +22,11 @@ HALT 중 접수된 신호는 202 로 받아들여지지만 실행기에서 즉�
 **HALT 걸기 전에 lake 에 알리는 것**이 원칙이다. 정지(`stop`) 중에 lake 가 보낸 신호는 Caddy 502 로 접수되지 않는다
 (lake 측 재전송 정책 합의 참고, `docs/REPLY_TO_LAKE.md`).
 
-관리 엔드포인트는 `.env` 의 `ADMIN_TOKEN` 이 있어야 켜지고(없으면 404), 헤더 `X-Admin-Token` 으로 호출한다.
-외부에서 호출할 때는 HTTPS(`https://<host>/admin/halt`) 만 쓰고, 토큰을 쉘 히스토리에 남기지 않는다.
+관리 엔드포인트는 `.env` 의 `ADMIN_TOKEN`(32바이트 이상) 이 있어야 켜지고(없으면 404), 헤더 `X-Admin-Token` 으로 호출한다.
+Caddy 는 `/state`, `/admin/*` 를 `ADMIN_ALLOW_CIDR`(기본 `127.0.0.1/32`) 밖에서 404 로 막으므로 기본값에서는 서버 로컬에서
+`ssh_run.py "curl -s -H 'X-Admin-Token: …' -X POST http://127.0.0.1:8787/admin/halt"` 로 쓴다. 외부에서 쓰려면
+`python deploy/push.py --admin-cidr <운영자IP>/32` 로 허용 CIDR 을 넣고 HTTPS 로만 호출하며, 토큰을 쉘 히스토리에 남기지 않는다.
+같은 IP 에서 토큰 실패가 60초에 10회를 넘으면 그 창이 지날 때까지 401 만 돌아온다.
 
 ## 2. 로그
 
@@ -44,9 +47,12 @@ python deploy/ssh_run.py "sudo journalctl -u caddy -n 50 --no-pager" # HTTPS/인
 
 ```bash
 python deploy/ssh_run.py "curl -s https://<host>/healthz"
-# {"ok":true,"halted":false,"inconsistent":{"test":false,"live":false}}
+# {"ok":true,"halted":false,"inconsistent":{"test":false,"live":false},"protection_missing":{"test":0,"live":0}}
 python deploy/ssh_run.py "curl -s -H 'X-Admin-Token: <token>' http://127.0.0.1:8787/state"
 ```
+
+`protection_missing` 이 0 이 아니면 보호가격이 설정된 open lot 에 보호주문이 빠져 있다는 뜻이다(생성 실패/거래소 쪽 취소).
+30초 대사가 자동으로 다시 만들며 실패하면 `PROTECTION_FAILED` 알림이 반복된다 → Bybit 화면에서 조건부 주문을 확인한다.
 
 `/state` 주요 키:
 
@@ -58,6 +64,8 @@ python deploy/ssh_run.py "curl -s -H 'X-Admin-Token: <token>' http://127.0.0.1:8
 | `signals` | 최근 신호 30건: `status`(accepted→processing→done/rejected/error), `reason_code` |
 | `reports{mode}` | 최근 회신 15건: `state`(pending/sent/duplicate/failed/conflict/unsent), `http_status`, `attempts` |
 | `open_lots{mode}` | 우리 원장의 열린 lot: `qty`, `avg_entry`, `stop_loss`, `take_profit`, `protection_revision`, `protection_orders` |
+| `protection_missing{mode}` | 보호주문이 빠진 open lot 의 position_id 목록 (대사가 재생성 중) |
+| `ingress_rejections` | 서명 전 거부(401/400 BAD_JSON/413/415 등) 누적 횟수 — DB 에는 남기지 않는다 |
 | `snapshot_positions{mode}` | 다음 스냅샷에 실릴 포지션 목록 (확인된 SL/TP 포함) |
 | `exchange_positions{mode}` | 거래소 실제 포지션 `{position_idx: {size, side, avg_price, mark_price}}` (PaperExchange 면 시뮬레이터 값) |
 
@@ -67,11 +75,13 @@ python deploy/ssh_run.py "curl -s -H 'X-Admin-Token: <token>' http://127.0.0.1:8
 ## 4. 장애별 대응
 
 ### 4.1 `EXCHANGE_TIMEOUT` (회신 status `error`)
-시장가를 냈지만 `exchange.fill_poll_timeout_s`(기본 10초) 안에 종결 상태를 확인하지 못했다. **주문은 거래소에 남아 있거나
-이미 체결됐을 수 있다.** 실행기는 체결된 만큼만 lot 에 반영하고 알림을 보낸다.
+시장가를 냈지만 `exchange.fill_poll_timeout_s`(기본 10초) 안에 종결 상태를 확인하지 못했다(또는 주문 전송 자체가 네트워크
+오류였고 조회도 안 됐다). **주문은 거래소에 남아 있거나 이미 체결됐을 수 있다.** 실행기는 체결된 만큼만 lot 에 반영하고 알림을
+보내며, 그 주문은 `orders` 에 미확정으로 남아 **30초 대사마다 거래소에서 재확인**된다.
 
-1. 다음 대사(30초)에서 거래소 포지션과 lot 이 어긋나면 자동으로 `RECONCILE_REQUIRED` 가 뜬다 → §4.3.
-2. 어긋나지 않으면(IOC 가 전량 취소되었거나 체결이 모두 반영됨) 조치 불필요. `/state` 의 `exchange_positions` 로 확인.
+1. 재확인에서 종결(체결)이 확인되면 자동으로 체결 회신 → lot 반영 → 보호주문 생성 → 신호 `done`(note `LATE_VERIFIED`) + 알림
+   "late fills verified". 그 사이 포지션과 lot 이 어긋나 `RECONCILE_REQUIRED` 가 떴더라도 같은 대사에서 내려간다.
+2. 거래소에 끝내 없으면(20회 ≈ 10분) 주문은 `absent` 로 닫히고 알림이 온다 → lake 에 "미실행" 으로 알린다.
 3. 반복되면 Bybit 상태/네트워크 문제. HALT 를 걸고 lake 에 알린다.
 
 ### 4.2 `UNKNOWN_STATE`
@@ -82,8 +92,16 @@ python deploy/ssh_run.py "curl -s -H 'X-Admin-Token: <token>' http://127.0.0.1:8
 1. `/state` 의 `signals` 에서 해당 `event_id` 의 `note` 를 본다 (`recovered: order not found on exchange` 등).
 2. Bybit 앱/웹에서 해당 시각 주문·체결 내역을 확인한다. 주문이 없었다면 lake 에 "미실행" 으로 알린다 — lake 가 새
    `event_id`/`event_sequence` 로 재발신해야 한다(같은 event_id 는 200 duplicate 로 접수만 되고 재실행되지 않는다).
-3. 체결이 있었는데 lot 에 없다면 §4.3 대로 대사한다. protection_update 였다면 Bybit 의 조건부 주문 목록과
-   `open_lots.protection_orders` 를 대조해 빠진 보호주문을 확인한다 (다음 protection_update 신호가 오면 전부 취소 후 재생성된다).
+3. 체결이 있었는데 lot 에 없다면 §4.1 의 자동 재확인을 기다리거나(주문 행이 `unknown` 이면 대사가 재확인한다) §4.3 대로 대사한다.
+   protection_update 였다면 lot 이 이미 새 revision 이면 대사가 빠진 보호주문을 자동으로 다시 만들고(`protection_missing` 확인),
+   아니면 lake 가 같은 revision 을 재전송하면 된다.
+
+### 4.2a `PROTECTION_FAILED` 알림
+체결은 됐는데 SL/TP 조건부 주문 생성(또는 취소)에 실패했다. 신호는 체결대로 `done`(note `PROTECTION_FAILED`) 로 끝나고,
+`/healthz` 의 `protection_missing` 이 올라간다. 30초 대사가 `lot.stop_loss/take_profit` 로 다시 만든다 — 알림이 반복되면
+원인(수량 반올림, 레이트리밋, 거래소 장애)을 보고 필요하면 Bybit 화면에서 수동으로 스탑을 넣고 HALT 를 건다.
+보호가격이 이미 지난 경우(예: 진입 직후 급락)는 실패가 아니라 즉시 reduceOnly 시장가로 청산되며 `auto:sl`/`auto:tp` 회신과
+"already crossed" 알림이 온다.
 
 ### 4.3 불일치 플래그 (`inconsistent=true`, `RECONCILE_REQUIRED`)
 30초 대사에서 **positionIdx 별 거래소 size ≠ 열린 lot 수량 합**이면 플래그가 선다. 효과: 그 mode 의 `entry/add` 는
@@ -164,9 +182,9 @@ python deploy/ssh_run.py "curl -s -H 'X-Admin-Token: <token>' http://127.0.0.1:8
 
 ## 8. 재시작 복구 의미 (restart recovery)
 
-- `accepted` 상태 신호: 재시작 뒤 그대로 FIFO 로 실행된다. 단 `expires_at_ms` 는 **접수 시에만** 검사하므로, 긴 정지 뒤
-  오래된 신호가 실행될 수 있다 → 장시간 정지했다면 **HALT 를 켠 채 시작**해 `/state` 를 보고 결정한다
-  (HALT 중 실행되면 `rejected/OPERATOR_HALT` 회신으로 종결된다).
+- `accepted` 상태 신호: 재시작 뒤 그대로 FIFO 로 실행되지만 **실행 시점에 `expires_at_ms` 를 다시 검사**하므로 정지 중에
+  만료된 신호는 `rejected/EXPIRED` 로만 회신되고 실행되지 않는다. 그래도 장시간 정지 뒤에는 **HALT 를 켠 채 시작**해 `/state` 를
+  보고 재개하는 것이 안전하다(HALT 중 실행되면 `rejected/OPERATOR_HALT`).
 - `processing` 상태 신호(실행 중 죽음): **재실행하지 않는다.** entry/add/partial_exit/full_exit 는 `orderLinkId` 로 거래소
   주문을 조회해 있으면 체결 수집을 이어 마무리(회신·lot 반영), 없으면 `error/UNKNOWN_STATE` + 알림(§4.2).
   `protection_update` 는 판정 불가 → `UNKNOWN_STATE`. test 기록 전용은 `TEST_RECORD_ONLY` 로 닫는다.
@@ -174,4 +192,9 @@ python deploy/ssh_run.py "curl -s -H 'X-Admin-Token: <token>' http://127.0.0.1:8
   sequence 는 `meta` 에 영속되어 재시작 뒤에도 이어진다.
 - 보호주문: 거래소에 그대로 남아 있다. 첫 대사(기동 2초 뒤 첫 스냅샷)에서 정지 중 체결된 SL/TP 를 수집해
   `auto:sl:…`/`auto:tp:…` 회신을 만들고 lot 을 줄인다.
-- `systemd Restart=always, RestartSec=5` 이므로 크래시 시 자동 재시작된다. 반복 크래시면 `journalctl` 로 원인 확인 후 HALT.
+- `systemd Restart=always, RestartSec=5` 이므로 크래시 시 자동 재시작되지만, 5분 안에 5회를 넘기면(`StartLimitBurst`) 멈추고,
+  설정 오류(exit 2) 는 재시작하지 않는다. `journalctl` 로 원인 확인 → 수정 → `sudo systemctl reset-failed lake-executor && sudo systemctl start lake-executor`.
+- 기동 시 `ensure_account_setup` 은 같은 설정을 이미 적용했으면(원장 `meta`) 거래소 쓰기를 반복하지 않는다. 포지션 모드/레버리지를
+  거래소 화면에서 바꿨다면 `config.json` 값을 바꾸거나 `meta` 의 `account_setup:live` 를 지워 다시 적용시킨다.
+- 배포 스크립트의 SSH 는 `deploy/known_hosts` 의 호스트 키만 신뢰한다. 인스턴스를 재생성해 키가 바뀌면 "HOST KEY MISMATCH" 로
+  거부되므로 그 줄을 지우고 지문을 확인한 뒤 `--trust-new-host-key` 로 다시 기록한다.

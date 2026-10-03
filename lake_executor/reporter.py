@@ -156,11 +156,12 @@ class Reporter:
     def execution(self, mode: Any, *, event_id: Any, position_id: Any, strategy: Any, leg: Any, position_idx: Any,
                   action: Any, status: Any, qty: float | None = None, fill_price: float | None = None,
                   order_id: str | None = None, fill_id: str | None = None, reason_code: Any = None,
-                  observed_at_ms: int | None = None) -> dict:
+                  observed_at_ms: int | None = None, mark_fill_reported: str | None = None) -> dict:
         """execution 회신을 pending 으로 저장. 반환: allocate_report 결과 + 'payload'(본문 dict).
 
         status/action/reason_code 는 Enum 이든 문자열이든 받는다. 체결 상태가 아니면 qty/fill_price/fill_id 는 null 로
         강제되고, 체결 상태인데 값이 없으면 ReportError.
+        mark_fill_reported: 체결 회신이면 그 체결(exec_id)의 fills.reported=1 을 회신 생성과 같은 트랜잭션에서 기록한다.
         """
         mode = _enum(mode, MODES, "mode")
         leg_v = _enum(leg, LEGS, "leg")
@@ -196,7 +197,7 @@ class Reporter:
                 "execution": dict(execution),
             }
 
-        return self._allocate(mode, KIND_EXECUTION, observed_at_ms, build)
+        return self._allocate(mode, KIND_EXECUTION, observed_at_ms, build, mark_fill_reported=mark_fill_reported)
 
     def snapshot(self, mode: Any, positions: list[dict], observed_at_ms: int) -> dict:
         """complete 스냅샷을 pending 으로 저장. positions 항목 키:
@@ -213,6 +214,7 @@ class Reporter:
         items: list[dict] = []
         seen: set[str] = set()
         idx_kinds: set[str] = set()
+        one_way_legs: set[str] = set()
         for p in positions:
             item = self._snapshot_position(p)
             pid = item["position_id"]
@@ -220,9 +222,13 @@ class Reporter:
                 raise ReportError(f"duplicate position_id in snapshot: {pid}")
             seen.add(pid)
             idx_kinds.add("one_way" if item["position_idx"] == 0 else "hedge")
+            if item["position_idx"] == 0:
+                one_way_legs.add(item["leg"])
             items.append(item)
         if len(idx_kinds) > 1:
             raise ReportError("snapshot must not mix position_idx 0 with 1/2")
+        if len(one_way_legs) > 1:
+            raise ReportError("one-way mode (position_idx 0) cannot hold opposing long/short lots")
 
         def build(report_id: str, sequence: int, ts: int, observed: int) -> dict:
             out_positions = []
@@ -281,7 +287,8 @@ class Reporter:
             "kind": kind,
         }
 
-    def _allocate(self, mode: str, kind: str, observed_at_ms: int, build: Callable[[str, int, int, int], dict]) -> dict:
+    def _allocate(self, mode: str, kind: str, observed_at_ms: int, build: Callable[[str, int, int, int], dict],
+                  mark_fill_reported: str | None = None) -> dict:
         payload_box: dict = {}
 
         def build_and_keep(report_id: str, sequence: int, ts: int, observed: int) -> dict:
@@ -289,7 +296,8 @@ class Reporter:
             payload_box["payload"] = body
             return body
 
-        alloc = self.store.allocate_report(mode, kind, observed_at_ms, build_and_keep, canonical_json)
+        alloc = self.store.allocate_report(mode, kind, observed_at_ms, build_and_keep, canonical_json,
+                                           mark_fill_reported=mark_fill_reported)
         alloc = dict(alloc)
         alloc["payload"] = payload_box.get("payload")
         log.info("report %s %s seq=%s id=%s", mode, kind, alloc.get("sequence"), alloc.get("report_id"))

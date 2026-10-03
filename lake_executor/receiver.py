@@ -10,26 +10,34 @@
 
 규칙
   - 수신 경로는 DB 에만 쓴다(executor 직접 호출 없음). 2xx 는 접수 확인일 뿐이다.
-  - 거부(400/401/409/410/413/415/503)는 store.log_ingress(code, event_id, body) 로 남긴다(본문은 sha256 만).
-  - 응답/INFO 로그에 시크릿·원본 본문·내부 예외 원문을 넣지 않는다.
-  - 관리 엔드포인트는 X-Admin-Token(상수 시간 비교) 필요, ADMIN_TOKEN 미설정 시 404.
+  - 본문은 스트리밍으로 읽으며 max_body_bytes 를 넘는 순간 413 (Content-Length 없는 chunked 요청도 메모리 상한).
+  - 검증·영속 접수는 스레드풀에서 돈다 (SQLite fsync 가 이벤트 루프를 막지 않도록).
+  - **서명 전 거부(400 BAD_JSON/BAD_MODE, 401, 413, 415, 503)는 DB 에 쓰지 않고 메모리 카운터로만 센다**
+    (인증 없는 요청 폭주가 디스크/락을 소모하지 못하게). 서명 통과 뒤 거부(400 SCHEMA/의미, 409, 410, 401 TIMESTAMP_MISMATCH)
+    는 store.log_ingress(code, event_id, body) 로 남긴다(본문은 sha256 만). ingress_log 는 실행기가 주기적으로 정리한다.
+  - 응답/INFO 로그에 시크릿·원본 본문·내부 예외 원문을 넣지 않는다. 로그에 찍는 event_id 는 ID 패턴을 통과한 값만.
+  - 관리 엔드포인트는 X-Admin-Token(상수 시간 비교) 필요, ADMIN_TOKEN 미설정 시 404. 같은 IP 의 실패가 잦으면 잠시 비교 없이 401.
   - import 시 부작용 없음: create_app(settings, store, services) 로만 앱을 만든다.
 
 services: executor / reporter / alerts 핸들을 담은 간단한 객체 또는 dict (전부 선택).
 """
 from __future__ import annotations
 
+import collections
 import hmac
 import json
 import logging
 import os
+import re
+import threading
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from . import auth, store as st
-from .schemas import Signal
+from .schemas import ID_PATTERN, Signal
 from .util import now_ms
 
 log = logging.getLogger("lake_executor.receiver")
@@ -38,18 +46,26 @@ MODES = ("test", "live")
 ADMIN_HEADER = "X-Admin-Token"
 STATE_SIGNAL_LIMIT = 30
 STATE_REPORT_LIMIT = 15
+ID_RE = re.compile(ID_PATTERN)
+# 관리 토큰 실패 제한: 같은 IP 가 창 안에서 이만큼 실패하면 창이 지날 때까지 비교 없이 401
+ADMIN_FAIL_LIMIT = 10
+ADMIN_FAIL_WINDOW_MS = 60_000
 
 
 # --------------------------------------------------------------------------- #
 # 수신 거부 예외 (내부용) — code 는 짧은 코드, 응답에 그대로 노출 가능
 # --------------------------------------------------------------------------- #
 class _Reject(Exception):
-    def __init__(self, status: int, error: str, code: str | None = None, extra: dict | None = None):
+    """authenticated=True 인 거부만 DB(ingress_log) 에 남긴다. 서명 전 거부는 메모리 카운터로만."""
+
+    def __init__(self, status: int, error: str, code: str | None = None, extra: dict | None = None,
+                 authenticated: bool = False):
         super().__init__(f"{status} {error} {code or ''}".strip())
         self.status = status
         self.error = error
         self.code = code or error
         self.extra = extra or {}
+        self.authenticated = authenticated
 
     def body(self) -> dict:
         out: dict[str, Any] = {"error": self.error, "code": self.code}
@@ -78,15 +94,65 @@ def _reject_constant(name: str):
 
 
 def parse_signal_json(raw: bytes) -> dict:
-    """원본 바이트를 한 번만 파싱. 중복 키 / NaN·Infinity / 비-객체 / 비-UTF-8 → ValueError."""
+    """원본 바이트를 한 번만 파싱. 중복 키 / NaN·Infinity / 비-객체 / 비-UTF-8 / 과도한 중첩 → ValueError."""
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as e:
         raise ValueError("body is not valid UTF-8") from e
-    obj = json.loads(text, object_pairs_hook=_no_duplicate_pairs, parse_constant=_reject_constant)
+    try:
+        obj = json.loads(text, object_pairs_hook=_no_duplicate_pairs, parse_constant=_reject_constant)
+    except RecursionError as e:
+        raise ValueError("body nested too deeply") from e
     if not isinstance(obj, dict):
         raise ValueError("body must be a JSON object")
     return obj
+
+
+class IngressStats:
+    """서명 전 거부 등 DB 에 쓰지 않는 수신 결과의 메모리 카운터 (/state 에 노출)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.counts: dict[str, int] = collections.defaultdict(int)
+
+    def bump(self, code: str) -> None:
+        with self._lock:
+            self.counts[code] += 1
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self.counts)
+
+
+class _AdminThrottle:
+    """IP 별 관리 토큰 실패 횟수 (창 안에서 ADMIN_FAIL_LIMIT 초과 시 비교 생략)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._fails: dict[str, collections.deque] = {}
+
+    def blocked(self, ip: str) -> bool:
+        now = now_ms()
+        with self._lock:
+            dq = self._fails.get(ip)
+            if not dq:
+                return False
+            while dq and now - dq[0] > ADMIN_FAIL_WINDOW_MS:
+                dq.popleft()
+            return len(dq) >= ADMIN_FAIL_LIMIT
+
+    def fail(self, ip: str) -> None:
+        with self._lock:
+            if len(self._fails) > 1024:
+                self._fails.clear()
+            self._fails.setdefault(ip, collections.deque()).append(now_ms())
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip() or "?"
+    return (request.client.host if request.client else None) or "?"
 
 
 # --------------------------------------------------------------------------- #
@@ -155,9 +221,23 @@ def _content_length(request: Request) -> int | None:
 def _is_json_content_type(request: Request) -> bool:
     ct = request.headers.get("content-type")
     if ct is None or ct.strip() == "":
-        return True  # 헤더가 아예 없으면 본문 파싱으로 판단 (명시적으로 다른 타입이면 거부)
+        return False  # 계약(§2): Content-Type: application/json 필수
     mt = ct.split(";", 1)[0].strip().lower()
     return mt == "application/json" or mt.endswith("+json")
+
+
+async def _read_body_capped(request: Request, max_body: int) -> bytes | None:
+    """본문을 스트리밍으로 읽되 max_body 를 넘는 순간 중단(None). chunked 요청도 메모리 상한을 지킨다."""
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_body:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _schema_error_summary(e: Exception) -> list[str]:
@@ -195,13 +275,28 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
         return _json(500, {"error": "INTERNAL"})
 
     # ------------------------------------------------------------------ 신호 수신
+    stats = IngressStats()
+    app.state.ingress_stats = stats
+    admin_throttle = _AdminThrottle()
+
     def _log_ingress(code: str, event_id: str | None, body: bytes | None, status: int) -> None:
         try:
             store.log_ingress(code, event_id, body, note=f"http={status}")
         except Exception as e:  # noqa: BLE001 - 기록 실패가 응답을 막지 않는다
             log.warning("log_ingress failed: %s", type(e).__name__)
 
-    def _validate(raw: bytes, request: Request) -> tuple[Signal, dict]:
+    def _reject_response(r: _Reject, raw: bytes | None) -> JSONResponse:
+        ev = r.extra.get("event_id")
+        ev = ev if isinstance(ev, str) and ID_RE.fullmatch(ev) else None
+        if r.authenticated:
+            _log_ingress(r.code, ev, raw, r.status)
+            log.info("signal rejected http=%s code=%s event_id=%s", r.status, r.code, ev)
+        else:
+            stats.bump(r.code)
+            log.info("signal rejected (pre-auth) http=%s code=%s", r.status, r.code)
+        return _json(r.status, r.body())
+
+    def _validate(raw: bytes, headers: dict[str, str | None]) -> tuple[Signal, dict]:
         """검증 통과 시 (Signal, parsed dict). 실패 시 _Reject."""
         # 1) JSON 파싱 (한 번만)
         try:
@@ -211,8 +306,9 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
         except ValueError:
             raise _Reject(400, "BAD_JSON", "PARSE_ERROR")
 
+        # 서명 전 단계에서 응답/로그에 되돌리는 event_id 는 ID 패턴을 통과한 값만 (로그 주입 방지)
         event_id = data.get("event_id")
-        event_id = event_id if isinstance(event_id, str) and 0 < len(event_id) <= 128 else None
+        event_id = event_id if isinstance(event_id, str) and ID_RE.fullmatch(event_id) else None
 
         # 2) mode → 시크릿 선택
         mode = data.get("mode")
@@ -222,63 +318,47 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
         if not secret:
             raise _Reject(503, "SECRET_NOT_CONFIGURED", "SECRET_NOT_CONFIGURED", {"mode": mode, "event_id": event_id})
 
-        # 3) 서명/시각 검증 (원본 바이트 그대로)
+        # 3) 서명/시각 검증 (원본 바이트 그대로). 본문 ts 가 정수가 아니면 서명 확인 뒤 TIMESTAMP_MISMATCH
         body_ts = data.get("ts")
-        if isinstance(body_ts, bool) or not isinstance(body_ts, int):
-            body_ts = None  # 스키마 단계에서 400 으로 걸러진다
+        ts_is_int = isinstance(body_ts, int) and not isinstance(body_ts, bool)
         try:
-            auth.verify(raw, request.headers.get("x-signature"), request.headers.get("x-timestamp"),
-                        body_ts, secret, now_ms(), max_skew)
+            auth.verify(raw, headers.get("x-signature"), headers.get("x-timestamp"),
+                        body_ts if ts_is_int else None, secret, now_ms(), max_skew)
         except auth.AuthError as e:
             if e.code == "SECRET_NOT_CONFIGURED":
                 raise _Reject(503, "SECRET_NOT_CONFIGURED", e.code, {"mode": mode, "event_id": event_id})
             raise _Reject(401, "UNAUTHORIZED", e.code, {"event_id": event_id})
+        if not ts_is_int:
+            raise _Reject(401, "UNAUTHORIZED", "TIMESTAMP_MISMATCH", {"event_id": event_id}, authenticated=True)
 
         # 4) 스키마
         try:
             sig = Signal.model_validate(data)
         except Exception as e:  # pydantic ValidationError (값은 노출하지 않음)
             raise _Reject(400, "INVALID_SIGNAL", "SCHEMA",
-                          {"event_id": event_id, "fields": _schema_error_summary(e)})
+                          {"event_id": event_id, "fields": _schema_error_summary(e)}, authenticated=True)
 
         # 5) 의미 검증
         if sig.symbol != settings.symbol:
-            raise _Reject(400, "INVALID_SIGNAL", "SYMBOL_MISMATCH", {"event_id": sig.event_id})
+            raise _Reject(400, "INVALID_SIGNAL", "SYMBOL_MISMATCH", {"event_id": sig.event_id}, authenticated=True)
         if sig.position_idx not in settings.allowed_position_idx():
-            raise _Reject(400, "INVALID_SIGNAL", "POSITION_MODE_MISMATCH", {"event_id": sig.event_id})
+            raise _Reject(400, "INVALID_SIGNAL", "POSITION_MODE_MISMATCH", {"event_id": sig.event_id},
+                          authenticated=True)
 
         # 6) 만료
         if now_ms() > int(sig.expires_at_ms):
-            raise _Reject(410, "EXPIRED", "EXPIRED", {"event_id": sig.event_id})
+            raise _Reject(410, "EXPIRED", "EXPIRED", {"event_id": sig.event_id}, authenticated=True)
         return sig, data
 
-    @app.post(signal_path)
-    async def receive_signal(request: Request):
-        # 인코딩/타입/크기 — 본문을 읽기 전에 거를 수 있는 것부터
-        enc = (request.headers.get("content-encoding") or "").strip().lower()
-        if enc and enc != "identity":
-            _log_ingress("UNSUPPORTED_ENCODING", None, None, 415)
-            return _json(415, {"error": "UNSUPPORTED_MEDIA_TYPE", "code": "CONTENT_ENCODING_NOT_ALLOWED"})
-        if not _is_json_content_type(request):
-            _log_ingress("UNSUPPORTED_MEDIA_TYPE", None, None, 415)
-            return _json(415, {"error": "UNSUPPORTED_MEDIA_TYPE", "code": "CONTENT_TYPE_NOT_JSON"})
-        cl = _content_length(request)
-        if cl is not None and cl > max_body:
-            _log_ingress("PAYLOAD_TOO_LARGE", None, None, 413)
-            return _json(413, {"error": "PAYLOAD_TOO_LARGE", "code": "PAYLOAD_TOO_LARGE", "max_bytes": max_body})
-
-        raw = await request.body()
-        if len(raw) > max_body:
-            _log_ingress("PAYLOAD_TOO_LARGE", None, raw, 413)
-            return _json(413, {"error": "PAYLOAD_TOO_LARGE", "code": "PAYLOAD_TOO_LARGE", "max_bytes": max_body})
-
+    def _handle_signal(raw: bytes, headers: dict[str, str | None]) -> JSONResponse:
+        """스레드풀에서 실행: 검증 → 영속 접수. 어떤 예외도 500 으로 새지 않게 한다."""
         try:
-            sig, _data = _validate(raw, request)
+            sig, _data = _validate(raw, headers)
         except _Reject as r:
-            ev = r.extra.get("event_id")
-            _log_ingress(r.code, ev if isinstance(ev, str) else None, raw, r.status)
-            log.info("signal rejected http=%s code=%s event_id=%s", r.status, r.code, ev)
-            return _json(r.status, r.body())
+            return _reject_response(r, raw)
+        except Exception as e:  # noqa: BLE001 - 예상 못 한 본문 → 400 (500/트레이스백 금지)
+            log.warning("signal validation error: %s", type(e).__name__)
+            return _reject_response(_Reject(400, "INVALID_SIGNAL", "UNPROCESSABLE"), raw)
 
         # 7) 영속 접수
         try:
@@ -292,37 +372,77 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
                      sig.mode.value, sig.event_id, sig.position_id, sig.event_sequence, sig.action.value)
             return _json(202, {"accepted": True, "event_id": sig.event_id})
         if result == "duplicate":
-            log.info("signal duplicate event_id=%s", sig.event_id)
+            log.info("signal duplicate mode=%s event_id=%s", sig.mode.value, sig.event_id)
             return _json(200, {"accepted": True, "duplicate": True})
         code = "EVENT_ID_CONFLICT" if result == "conflict" else "SEQUENCE_CONFLICT"
         _log_ingress(code, sig.event_id, raw, 409)
-        log.warning("signal conflict code=%s event_id=%s position_id=%s seq=%s",
-                    code, sig.event_id, sig.position_id, sig.event_sequence)
+        log.warning("signal conflict code=%s mode=%s event_id=%s position_id=%s seq=%s",
+                    code, sig.mode.value, sig.event_id, sig.position_id, sig.event_sequence)
         return _json(409, {"error": "CONFLICT", "code": code})
 
+    @app.post(signal_path)
+    async def receive_signal(request: Request):
+        # 인코딩/타입/크기 — 본문을 읽기 전에 거를 수 있는 것부터 (서명 전 거부: DB 에 쓰지 않는다)
+        enc = (request.headers.get("content-encoding") or "").strip().lower()
+        if enc and enc != "identity":
+            stats.bump("UNSUPPORTED_ENCODING")
+            return _json(415, {"error": "UNSUPPORTED_MEDIA_TYPE", "code": "CONTENT_ENCODING_NOT_ALLOWED"})
+        if not _is_json_content_type(request):
+            stats.bump("UNSUPPORTED_MEDIA_TYPE")
+            return _json(415, {"error": "UNSUPPORTED_MEDIA_TYPE", "code": "CONTENT_TYPE_NOT_JSON"})
+        cl = _content_length(request)
+        if cl is not None and cl > max_body:
+            stats.bump("PAYLOAD_TOO_LARGE")
+            return _json(413, {"error": "PAYLOAD_TOO_LARGE", "code": "PAYLOAD_TOO_LARGE", "max_bytes": max_body})
+
+        raw = await _read_body_capped(request, max_body)
+        if raw is None:
+            stats.bump("PAYLOAD_TOO_LARGE")
+            return _json(413, {"error": "PAYLOAD_TOO_LARGE", "code": "PAYLOAD_TOO_LARGE", "max_bytes": max_body})
+
+        headers = {"x-signature": request.headers.get("x-signature"), "x-timestamp": request.headers.get("x-timestamp")}
+        return await run_in_threadpool(_handle_signal, raw, headers)
+
     # ------------------------------------------------------------------ healthz
+    def _protection_missing_map(executor: Any) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for m in MODES:
+            try:
+                out[m] = list(executor.protection_missing(m)) if executor is not None else []
+            except Exception as e:  # noqa: BLE001
+                log.warning("protection_missing(%s) failed: %s", m, type(e).__name__)
+                out[m] = []
+        return out
+
     @app.get("/healthz")
     def healthz():
         try:
             inconsistent = _inconsistent_map(store)
+            missing = _protection_missing_map(_executor())
         except Exception as e:  # noqa: BLE001
             log.warning("healthz store error: %s", type(e).__name__)
             return _json(503, {"ok": False})
-        return _json(200, {"ok": True, "halted": _halted(settings), "inconsistent": inconsistent})
+        return _json(200, {"ok": True, "halted": _halted(settings), "inconsistent": inconsistent,
+                           "protection_missing": {m: len(v) for m, v in missing.items()}})
 
     # ------------------------------------------------------------------ 관리
+    def _executor():
+        return _svc(services, "executor")
+
     def _admin_gate(request: Request) -> JSONResponse | None:
-        """ADMIN_TOKEN 미설정 → 404, 토큰 불일치 → 401, 통과 → None."""
+        """ADMIN_TOKEN 미설정 → 404, 토큰 불일치 → 401(IP 별 실패 제한), 통과 → None."""
         token = str(getattr(settings.secrets, "admin_token", "") or "")
         if not token:
             return _json(404, {"error": "NOT_FOUND"})
+        ip = _client_ip(request)
+        if admin_throttle.blocked(ip):
+            return _json(401, {"error": "UNAUTHORIZED"})
         given = request.headers.get(ADMIN_HEADER) or ""
         if not given or not hmac.compare_digest(given.encode("utf-8"), token.encode("utf-8")):
+            admin_throttle.fail(ip)
+            log.warning("admin: bad token from %s", ip)
             return _json(401, {"error": "UNAUTHORIZED"})
         return None
-
-    def _executor():
-        return _svc(services, "executor")
 
     def _exchange_positions(executor: Any, mode: str) -> Any:
         """거래소 포지션 요약 (executor.exchanges[mode].positions()). 없거나 실패하면 None."""
@@ -356,6 +476,8 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
             "signals": store.recent_signals(STATE_SIGNAL_LIMIT),
             "reports": {m: store.recent_reports(m, STATE_REPORT_LIMIT) for m in MODES},
             "open_lots": {m: store.open_lots(m) for m in MODES},
+            "protection_missing": _protection_missing_map(executor),
+            "ingress_rejections": stats.snapshot(),
             "snapshot_positions": {},
             "exchange_positions": {},
         }

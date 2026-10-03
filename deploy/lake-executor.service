@@ -2,6 +2,10 @@
 Description=lake-executor (lake webhook -> Bybit executor)
 After=network-online.target
 Wants=network-online.target
+# 지속 실패(설정 오류/DB 손상/Bybit 불통) 시 무한 재시작 금지: 5분 안에 5회 넘게 죽으면 멈춘다.
+# (기동마다 ensure_account_setup 쓰기·recover_processing 이 돌므로 5초 간격 영구 루프는 거래소에도 해롭다)
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -11,6 +15,8 @@ WorkingDirectory=/home/ubuntu/lake-executor
 ExecStart=/home/ubuntu/lake-executor/.venv/bin/python -m lake_executor serve
 Restart=always
 RestartSec=5
+# 설정 오류(exit 2) 는 재시작해도 같은 결과 → 재시작하지 않는다
+RestartPreventExitStatus=2
 # SIGTERM -> 정상 종료 (main.serve 가 처리). 체결 수집 중일 수 있으니 여유를 둔다.
 KillSignal=SIGTERM
 TimeoutStopSec=30

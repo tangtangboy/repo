@@ -109,7 +109,7 @@ def test_filled_stop_during_cancel_is_ingested_not_discarded(executor, store, pa
     새 SL 은 실제 잔량(0.002) 으로만 만든다 — 유령 수량/과대 스탑 없음."""
     pid = "race-sl"
     assert run_signal(executor, store, _long_entry(pid, stop_loss=85000))["status"] == "done"
-    lot_inst = store.get_lot("test", pid)["opened_at_ms"]
+    lot_inst = store.get_lot("test", "bybit", pid)["opened_at_ms"]
     fired = paper.set_price(84900)          # SL 체결 → 거래소 flat
     assert len(fired) == 1 and paper.positions() == {}
     seq = last_seq(store, "test")
@@ -119,7 +119,7 @@ def test_filled_stop_during_cancel_is_ingested_not_discarded(executor, store, pa
                       expected_qty_btc_after=0.002, reference_price=86000)
     row = run_signal(executor, store, add)
     assert row["status"] == "done", row
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["status"] == "open" and lot["qty"] == pytest.approx(0.002)
     assert paper.positions()[1]["size"] == pytest.approx(0.002)
     conds = paper.open_conditional_orders(1)
@@ -134,7 +134,7 @@ def test_filled_stop_during_cancel_is_ingested_not_discarded(executor, store, pa
     assert e["status"] == "filled" and e["reason_code"] == "STOP_LOSS_TRIGGERED" and e["action"] == "partial_exit"
     assert e["qty"] == pytest.approx(0.002) and e["fill_price"] == pytest.approx(84900)
     assert statuses[-1] == "snapshot"
-    assert executor.reconcile("test") is True and store.is_inconsistent("test") is False
+    assert executor.reconcile("test") is True and store.is_inconsistent("test", "bybit") is False
 
 
 # --------------------------------------------------------------------------- #
@@ -148,7 +148,7 @@ def test_entry_with_already_crossed_stop_is_closed_immediately_not_reported_reje
     row = run_signal(executor, store, d)
     assert row["status"] == "done", row
     assert paper.positions() == {}
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["status"] == "closed" and lot["qty"] == 0
     assert paper.open_conditional_orders(1) == []
     rs = load_reports(store, "test")
@@ -172,7 +172,7 @@ def test_crossed_take_profit_level_executes_that_level_and_keeps_rest(executor, 
     d = _long_entry(pid, qty_btc=0.004, expected_qty_btc_after=0.004, stop_loss=80000, take_profit=[85000, 90000])
     row = run_signal(executor, store, d)
     assert row["status"] == "done", row
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["status"] == "open" and lot["qty"] == pytest.approx(0.002)
     assert lot["protection_orders"]["tp_done"] == [0]
     assert sorted((c["trigger_price"], c["qty"]) for c in paper.open_conditional_orders(1)) == \
@@ -193,7 +193,7 @@ def test_protection_failure_after_fill_keeps_done_and_reconcile_self_heals(fexec
     assert row["status"] == "done" and "PROTECTION_FAILED" in (row["note"] or "")
     assert "rejected" not in execution_statuses(load_reports(store, "test"))
     assert alerts.contains("PROTECTION_FAILED")
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["status"] == "open" and lot["qty"] == pytest.approx(0.002)
     assert faulty.open_conditional_orders(1) == []
     assert fexecutor.protection_missing("test") == [pid]
@@ -201,7 +201,7 @@ def test_protection_failure_after_fill_keeps_done_and_reconcile_self_heals(fexec
     assert fexecutor.reconcile("test") is True
     assert fexecutor.protection_missing("test") == []
     assert [(c["trigger_price"], c["qty"]) for c in faulty.open_conditional_orders(1)] == [(85000.0, 0.002)]
-    assert store.get_lot("test", pid)["protection_orders"]["sl"]["price"] == 85000
+    assert store.get_lot("test", "bybit", pid)["protection_orders"]["sl"]["price"] == 85000
 
 
 # --------------------------------------------------------------------------- #
@@ -212,12 +212,12 @@ def test_conditional_timeout_after_placement_is_adopted_not_duplicated(fexecutor
     faulty.conditional_timeout_after_place = True
     row = run_signal(fexecutor, store, _long_entry(pid, stop_loss=85000))
     assert row["status"] == "done" and "PROTECTION_FAILED" not in (row["note"] or "")
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     sl = lot["protection_orders"]["sl"]
     assert sl and sl["order_id"]
     conds = faulty.open_conditional_orders(1)
     assert len(conds) == 1 and conds[0]["order_link_id"] == sl["order_link_id"]
-    assert store.get_order(sl["order_link_id"])["status"] == "Untriggered"
+    assert store.get_order(sl["order_link_id"], "bybit")["status"] == "Untriggered"
     assert fexecutor.reconcile("test") is True
     assert len(faulty.open_conditional_orders(1)) == 1    # reconcile 이 중복 생성하지 않는다
 
@@ -226,7 +226,7 @@ def test_reconcile_cancels_orphan_protection_and_replaces_missing(executor, stor
     """lot 이 참조하지 않는 우리 보호주문(고아)은 취소하고, 빠진 보호주문은 lot.stop_loss 로 다시 만든다."""
     pid = "orphan"
     run_signal(executor, store, _long_entry(pid, stop_loss=85000))
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     old_link = lot["protection_orders"]["sl"]["order_link_id"]
     lot["protection_orders"]["sl"] = None            # 원장에서만 사라짐 (크래시/버그 상황)
     store.upsert_lot(lot)
@@ -236,7 +236,7 @@ def test_reconcile_cancels_orphan_protection_and_replaces_missing(executor, stor
     conds = paper.open_conditional_orders(1)
     assert len(conds) == 1 and conds[0]["order_link_id"] != old_link
     assert paper.get_order(old_link)["status"] == "Cancelled"
-    assert store.get_order(old_link)["status"] == "Cancelled"
+    assert store.get_order(old_link, "bybit")["status"] == "Cancelled"
     assert alerts.contains("orphan")
     assert executor.protection_missing("test") == []
 
@@ -270,7 +270,7 @@ def test_protection_update_failure_allows_same_revision_retry(fexecutor, store, 
                      stop_loss=85500, take_profit=None)
     row = run_signal(fexecutor, store, pu)
     assert row["status"] == "error" and row["reason_code"] == "PROTECTION_FAILED"
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["protection_revision"] == 2 and lot["stop_loss"] == 85500
     assert lot["protection_orders"]["failed"] is True and faulty.open_conditional_orders(1) == []
     assert fexecutor.protection_missing("test") == [pid]
@@ -303,22 +303,22 @@ def test_unknown_order_after_timeout_is_verified_late_and_lot_protected(fexecuto
     faulty.hidden.add(link)                     # 주문 조회도 당장은 안 됨
     row = run_signal(fexecutor, store, d)
     assert row["status"] == "error" and row["reason_code"] == "EXCHANGE_TIMEOUT"
-    assert store.get_order(link)["status"] == "unknown"
-    assert store.get_lot("test", pid) is None
+    assert store.get_order(link, "bybit")["status"] == "unknown"
+    assert store.get_lot("test", "bybit", pid) is None
     assert faulty.positions()[1]["size"] == pytest.approx(0.002)   # 실제로는 체결됐다
     assert fexecutor.reconcile("test") is False                     # 아직 숨겨짐 → 불일치
-    assert store.is_inconsistent("test") is True
+    assert store.is_inconsistent("test", "bybit") is True
 
     faulty.hidden.discard(link)
     seq = last_seq(store, "test")
     assert fexecutor.reconcile("test") is True                      # 늦은 확인 → 체결 반영 → 일치
-    assert store.is_inconsistent("test") is False
-    lot = store.get_lot("test", pid)
+    assert store.is_inconsistent("test", "bybit") is False
+    lot = store.get_lot("test", "bybit", pid)
     assert lot and lot["status"] == "open" and lot["qty"] == pytest.approx(0.002)
     assert [(c["trigger_price"], c["qty"]) for c in faulty.open_conditional_orders(1)] == [(85000.0, 0.002)]
     row = store.get_signal(d["event_id"], "test")
     assert row["status"] == "done" and "LATE_VERIFIED" in (row["note"] or "")
-    assert store.get_order(link)["status"] == "Filled"
+    assert store.get_order(link, "bybit")["status"] == "Filled"
     rs = reports_after(store, "test", seq)
     assert execution_statuses(rs)[:1] == ["filled"]
     assert rs[0]["execution"]["event_id"] == d["event_id"] and rs[0]["execution"]["qty"] == pytest.approx(0.002)
@@ -338,7 +338,7 @@ def test_order_never_on_exchange_is_closed_absent_after_checks(fexecutor, store,
     # 거래소에서 영원히 안 보이면(실제로는 체결됐지만 테스트상 숨김) 상한 횟수 뒤 absent
     for _ in range(exmod._UNCERTAIN_MAX_CHECKS):
         fexecutor.reconcile("test")
-    assert store.get_order(link)["status"] == "absent"
+    assert store.get_order(link, "bybit")["status"] == "absent"
     assert alerts.contains("never appeared")
 
 
@@ -348,14 +348,14 @@ def test_order_never_on_exchange_is_closed_absent_after_checks(fexecutor, store,
 def test_reconcile_replaces_protection_cancelled_on_exchange(executor, store, paper, alerts):
     pid = "cancelled-sl"
     run_signal(executor, store, _long_entry(pid, stop_loss=85000, take_profit=[90000]))
-    old = store.get_lot("test", pid)["protection_orders"]
+    old = store.get_lot("test", "bybit", pid)["protection_orders"]
     assert paper.cancel_order(old["sl"]["order_link_id"])          # 운영자가 UI 에서 취소한 상황
     assert len(paper.open_conditional_orders(1)) == 1
     assert executor.reconcile("test") is True
     assert alerts.contains("protection orders missing")
     conds = sorted((c["trigger_price"], c["qty"]) for c in paper.open_conditional_orders(1))
     assert conds == [(85000.0, 0.002), (90000.0, 0.002)]
-    new = store.get_lot("test", pid)["protection_orders"]
+    new = store.get_lot("test", "bybit", pid)["protection_orders"]
     assert new["sl"]["order_link_id"] != old["sl"]["order_link_id"]
     assert executor.protection_missing("test") == []
 
@@ -363,7 +363,7 @@ def test_reconcile_replaces_protection_cancelled_on_exchange(executor, store, pa
 def test_reconcile_protection_read_error_alerts_but_snapshot_still_sent(fexecutor, store, faulty, alerts):
     pid = "read-err"
     run_signal(fexecutor, store, _long_entry(pid, stop_loss=85000))
-    link = store.get_lot("test", pid)["protection_orders"]["sl"]["order_link_id"]
+    link = store.get_lot("test", "bybit", pid)["protection_orders"]["sl"]["order_link_id"]
     faulty.get_order_raise.add(link)
     seq = last_seq(store, "test")
     snap = fexecutor.snapshot_now("test")
@@ -386,7 +386,7 @@ def test_partially_filled_canceled_is_cancelled_with_ioc_partial_note(fexecutor,
     assert elapsed < settings.fill_poll_timeout_s          # 타임아웃까지 기다리지 않는다
     assert row["status"] == "done" and row["reason_code"] is None
     assert "IOC_PARTIAL" in row["note"] and "QTY_MISMATCH" in row["note"]
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["qty"] == pytest.approx(0.001)
     assert [(c["trigger_price"], c["qty"]) for c in faulty.open_conditional_orders(1)] == [(85000.0, 0.001)]
     assert execution_statuses(load_reports(store, "test")) == ["acknowledged", "submitted", "partially_filled",
@@ -401,12 +401,12 @@ def test_close_lot_with_cancel_failure_is_closed_and_leftovers_retried(fexecutor
                      expected_qty_btc_after=0, reference_price=None)
     row = run_signal(fexecutor, store, fx)
     assert row["status"] == "done", row
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["status"] == "closed" and lot["qty"] == 0
     assert lot["protection_orders"]["sl"] is not None           # 취소 못 한 항목은 남겨 재시도
     assert len(faulty.open_conditional_orders(1)) == 2
     assert alerts.contains("PROTECTION_FAILED")
-    assert store.lots_with_pending_cancel("test")[0]["position_id"] == pid
+    assert store.lots_with_pending_cancel("test", "bybit")[0]["position_id"] == pid
     # 거래소 flat = lot 0 → 포지션 대사는 일치(True, 스냅샷 가능). 잔여 보호주문 취소 재시도는 실패 → 알림만.
     assert fexecutor.reconcile("test") is True
     assert alerts.contains("still has live protection orders")
@@ -415,9 +415,9 @@ def test_close_lot_with_cancel_failure_is_closed_and_leftovers_retried(fexecutor
     faulty.cancel_fail = False
     assert fexecutor.reconcile("test") is True
     assert faulty.open_conditional_orders(1) == []
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["protection_orders"]["sl"] is None and lot["protection_orders"]["tp"] == []
-    assert store.lots_with_pending_cancel("test") == []
+    assert store.lots_with_pending_cancel("test", "bybit") == []
     # 닫힌 lot 에 다시 진입 가능
     assert run_signal(fexecutor, store, _long_entry(pid, event_sequence=3))["status"] == "done"
 
@@ -470,16 +470,16 @@ def test_protection_not_found_requires_two_strikes_before_replacing(fexecutor, s
     """조회 지연/필터 차이로 한 번 안 보인 보호주문은 유지하고, 두 번 연속 없을 때만 항목을 지우고 다시 만든다."""
     pid = "absent-twice"
     run_signal(fexecutor, store, _long_entry(pid, stop_loss=85000))
-    link = store.get_lot("test", pid)["protection_orders"]["sl"]["order_link_id"]
+    link = store.get_lot("test", "bybit", pid)["protection_orders"]["sl"]["order_link_id"]
     faulty.hidden.add(link)
     assert fexecutor.reconcile("test") is True
-    assert store.get_lot("test", pid)["protection_orders"]["sl"]["order_link_id"] == link   # 1회: 유지
+    assert store.get_lot("test", "bybit", pid)["protection_orders"]["sl"]["order_link_id"] == link   # 1회: 유지
     assert len(faulty.open_conditional_orders(1)) == 1
     assert fexecutor.reconcile("test") is True
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["protection_orders"]["sl"]["order_link_id"] != link                        # 2회: 교체
     # 항목은 absent 로 지워지고, 같은 reconcile 의 고아 정리가 거래소에 남아 있던 옛 주문을 취소한다 (하나만 남는다)
-    assert store.get_order(link)["status"] in ("absent", "Cancelled")
+    assert store.get_order(link, "bybit")["status"] in ("absent", "Cancelled")
     faulty.hidden.discard(link)
     assert faulty.get_order(link)["status"] == "Cancelled"
     assert len(faulty.open_conditional_orders(1)) == 1

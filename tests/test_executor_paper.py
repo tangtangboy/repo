@@ -134,7 +134,7 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
     row = run_signal(executor, store, e1)
     assert row["status"] == "done" and row["reason_code"] is None, row
 
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["status"] == "open"
     assert lot["qty"] == pytest.approx(0.002)
     assert lot["avg_entry"] == pytest.approx(86000)
@@ -150,7 +150,7 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
     assert sorted((c["trigger_price"], c["qty"]) for c in conds) == [(84000.0, 0.002), (88000.0, 0.002)]
     assert all(c["side"] == "Buy" for c in conds)
     # 시장가 주문 멱등 키
-    assert store.get_order(order_link_id("test", e1["event_id"]))["status"] == "Filled"
+    assert store.get_order(order_link_id("test", e1["event_id"]), "bybit")["status"] == "Filled"
 
     rs = load_reports(store, "test")
     assert execution_statuses(rs) == ["acknowledged", "submitted", "filled", "snapshot"]
@@ -177,7 +177,7 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
                      reference_price=87000)
     row = run_signal(executor, store, e2)
     assert row["status"] == "done" and row["reason_code"] is None
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["qty"] == pytest.approx(0.004)
     assert lot["avg_entry"] == pytest.approx(86500)
     assert lot["protection_revision"] == 1
@@ -201,11 +201,11 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
                      reference_price=None)
     row = run_signal(executor, store, e3)
     assert row["status"] == "done" and row["reason_code"] is None
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["qty"] == pytest.approx(0.003)
     assert lot["avg_entry"] == pytest.approx(86500)   # 청산은 평균가를 바꾸지 않는다
     assert paper.positions()[2]["size"] == pytest.approx(0.003)
-    o = store.get_order(order_link_id("test", e3["event_id"]))
+    o = store.get_order(order_link_id("test", e3["event_id"]), "bybit")
     assert o["reduce_only"] == 1 and o["side"] == "Buy" and o["status"] == "Filled"
     conds = open_protections(paper, 2)
     assert sorted((c["trigger_price"], c["qty"]) for c in conds) == [(84000.0, 0.003), (88000.0, 0.003)]
@@ -223,9 +223,9 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
                      reference_price=None)
     row = run_signal(executor, store, e4)
     assert row["status"] == "rejected" and row["reason_code"] == "QTY_EXCEEDS_LOT"
-    assert store.get_lot("test", pid)["qty"] == pytest.approx(0.003)
+    assert store.get_lot("test", "bybit", pid)["qty"] == pytest.approx(0.003)
     assert paper.positions()[2]["size"] == pytest.approx(0.003)
-    assert store.get_order(order_link_id("test", e4["event_id"])) is None
+    assert store.get_order(order_link_id("test", e4["event_id"]), "bybit") is None
     rs = reports_after(store, "test", seq_mark)
     assert execution_statuses(rs) == ["acknowledged", "rejected"]
     check_execution(rs[1], event_id=e4["event_id"], position_id=pid, action="partial_exit", status="rejected",
@@ -237,7 +237,7 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
                      reference_price=None, protection_revision=2, stop_loss=89000, take_profit=[84000, 83000])
     row = run_signal(executor, store, e5)
     assert row["status"] == "done" and row["reason_code"] is None
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["protection_revision"] == 2
     assert lot["stop_loss"] == 89000 and lot["take_profit"] == [84000.0, 83000.0]
     assert lot["qty"] == pytest.approx(0.003)
@@ -246,7 +246,7 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
     assert [(t["price"], t["qty"]) for t in po["tp"]] == [(84000.0, pytest.approx(0.001)), (83000.0, pytest.approx(0.002))]
     links = [po["sl"]["order_link_id"]] + [t["order_link_id"] for t in po["tp"]]
     assert all(LINK_ID_RE.match(l) for l in links) and len(set(links)) == 3
-    assert all(store.get_order(l)["status"] == "Untriggered" and store.get_order(l)["purpose"] in ("sl", "tp")
+    assert all(store.get_order(l, "bybit")["status"] == "Untriggered" and store.get_order(l, "bybit")["purpose"] in ("sl", "tp")
                for l in links)
     conds = open_protections(paper, 2)
     assert sorted((c["trigger_price"], c["qty"]) for c in conds) == [(83000.0, 0.002), (84000.0, 0.001), (89000.0, 0.003)]
@@ -263,7 +263,7 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
                      reference_price=None, protection_revision=2, stop_loss=90000, take_profit=None)
     row = run_signal(executor, store, e6)
     assert row["status"] == "rejected" and row["reason_code"] == "STALE_PROTECTION_REVISION"
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["stop_loss"] == 89000 and lot["protection_revision"] == 2
     assert len(open_protections(paper, 2)) == 3
     rs = reports_after(store, "test", seq_mark)
@@ -274,18 +274,18 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
 
     # ---- 7) full_exit → lot 잔량(0.003)만 reduceOnly 청산, 보호주문 전부 취소, lot closed, 스냅샷 []
     paper.place_market("Sell", 0.005, 2, False, "other-strategy-lot")   # 같은 레그의 다른 몫 (심볼 전량 청산 금지 검증)
-    store_lot_before = store.get_lot("test", pid)
+    store_lot_before = store.get_lot("test", "bybit", pid)
     assert store_lot_before["qty"] == pytest.approx(0.003)
     e7 = make_signal(**base, event_sequence=7, action="full_exit", qty_btc=0.003, expected_qty_btc_after=0,
                      reference_price=None)
     row = run_signal(executor, store, e7)
     assert row["status"] == "done" and row["reason_code"] is None, row
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["status"] == "closed" and lot["qty"] == 0 and lot["closed_at_ms"]
     assert lot["protection_orders"]["sl"] is None and lot["protection_orders"]["tp"] == []
     assert open_protections(paper, 2) == []
     assert paper.positions()[2]["size"] == pytest.approx(0.005)   # 다른 몫은 건드리지 않았다
-    o = store.get_order(order_link_id("test", e7["event_id"]))
+    o = store.get_order(order_link_id("test", e7["event_id"]), "bybit")
     assert o["reduce_only"] == 1 and o["qty"] == pytest.approx(0.003)
     rs = reports_after(store, "test", seq_mark)
     # 다른 몫 때문에 거래소 합계가 lot 합과 달라 스냅샷은 생략된다 (reconcile 불일치)
@@ -293,13 +293,13 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
     fill = check_execution(rs[2], event_id=e7["event_id"], position_id=pid, action="full_exit", status="filled",
                            leg="short", position_idx=2)
     assert fill["qty"] == pytest.approx(0.003)
-    assert store.is_inconsistent("test") is True
+    assert store.is_inconsistent("test", "bybit") is True
     # 다른 몫을 정리하면 다시 일치 → 빈 스냅샷(flat) 가능
     paper.place_market("Buy", 0.005, 2, True, "other-strategy-close")
     seq_mark = last_seq(store, "test")
     snap = executor.snapshot_now("test")
     assert snap is not None
-    assert store.is_inconsistent("test") is False
+    assert store.is_inconsistent("test", "bybit") is False
     rs = reports_after(store, "test", seq_mark)
     assert execution_statuses(rs) == ["snapshot"]
     check_snapshot(rs[0], [])
@@ -323,7 +323,7 @@ def test_full_lifecycle_on_paper(executor, store, paper, alerts):
                      reference_price=87000)
     row = run_signal(executor, store, e8)
     assert row["status"] == "done"
-    assert store.get_lot("test", pid)["status"] == "open"
+    assert store.get_lot("test", "bybit", pid)["status"] == "open"
 
 
 # --------------------------------------------------------------------------- #
@@ -336,7 +336,7 @@ def test_entry_on_open_lot_is_position_exists(executor, store, paper):
     d = make_signal(position_id=pid, event_sequence=2)
     row = run_signal(executor, store, d)
     assert row["status"] == "rejected" and row["reason_code"] == "POSITION_EXISTS"
-    assert store.get_lot("test", pid)["qty"] == pytest.approx(0.002)
+    assert store.get_lot("test", "bybit", pid)["qty"] == pytest.approx(0.002)
     assert paper.positions()[2]["size"] == pytest.approx(0.002)
     rs = reports_after(store, "test", seq)
     assert execution_statuses(rs) == ["acknowledged", "rejected"]
@@ -416,7 +416,7 @@ def test_halt_file_rejects_new_signals_but_keeps_protections(executor, store, pa
     d = make_signal(position_id=pid, event_sequence=2, action="add", qty_btc=0.001, expected_qty_btc_after=0.003)
     row = run_signal(executor, store, d)
     assert row["status"] == "rejected" and row["reason_code"] == "OPERATOR_HALT"
-    assert store.get_lot("test", pid)["qty"] == pytest.approx(0.002)
+    assert store.get_lot("test", "bybit", pid)["qty"] == pytest.approx(0.002)
     assert len(paper.open_conditional_orders(2)) == 1   # 기존 보호주문 유지
     rs = reports_after(store, "test", seq)
     assert execution_statuses(rs) == ["acknowledged", "rejected"]
@@ -426,7 +426,7 @@ def test_halt_file_rejects_new_signals_but_keeps_protections(executor, store, pa
     ops.resume(settings)
     d2 = make_signal(position_id=pid, event_sequence=3, action="add", qty_btc=0.001, expected_qty_btc_after=0.003)
     assert run_signal(executor, store, d2)["status"] == "done"
-    assert store.get_lot("test", pid)["qty"] == pytest.approx(0.003)
+    assert store.get_lot("test", "bybit", pid)["qty"] == pytest.approx(0.003)
 
 
 def test_live_signal_with_live_disabled_is_rejected_live_disabled(executor, store, paper, settings):
@@ -435,7 +435,7 @@ def test_live_signal_with_live_disabled_is_rejected_live_disabled(executor, stor
     row = run_signal(executor, store, d)
     assert row["status"] == "rejected" and row["reason_code"] == "LIVE_DISABLED"
     assert paper.positions() == {}                       # test 거래소도 건드리지 않는다
-    assert store.get_lot("live", "position-live-1") is None
+    assert store.get_lot("live", "bybit", "position-live-1") is None
     assert load_reports(store, "test") == []
     rs = load_reports(store, "live")
     assert execution_statuses(rs) == ["acknowledged", "rejected"]
@@ -453,7 +453,7 @@ def test_test_record_only_sends_acknowledged_only(settings, store, reporter, ale
     assert row["status"] == "done" and row["reason_code"] == "TEST_RECORD_ONLY"
     rs = load_reports(store, "test")
     assert execution_statuses(rs) == ["acknowledged"]
-    assert store.get_lot("test", d["position_id"]) is None
+    assert store.get_lot("test", "bybit", d["position_id"]) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -465,7 +465,7 @@ def test_stop_loss_trigger_closes_lot_via_reconcile(executor, store, paper, aler
                     stop_loss=85000, take_profit=[90000])
     assert run_signal(executor, store, d)["status"] == "done"
     assert paper.positions()[1]["size"] == pytest.approx(0.002)
-    lot_inst = store.get_lot("test", pid)["opened_at_ms"]
+    lot_inst = store.get_lot("test", "bybit", pid)["opened_at_ms"]
     seq = last_seq(store, "test")
 
     fired = paper.set_price(84900)
@@ -473,11 +473,11 @@ def test_stop_loss_trigger_closes_lot_via_reconcile(executor, store, paper, aler
     assert paper.positions() == {}
 
     assert executor.reconcile("test") is True
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["status"] == "closed" and lot["qty"] == 0
     assert lot["protection_orders"]["sl"] is None and lot["protection_orders"]["tp"] == []
     assert paper.open_conditional_orders(1) == []       # 형제 TP 취소
-    assert store.is_inconsistent("test") is False
+    assert store.is_inconsistent("test", "bybit") is False
     assert alerts.contains("STOP_LOSS_TRIGGERED")
 
     rs = reports_after(store, "test", seq)
@@ -505,7 +505,7 @@ def test_take_profit_partial_trigger_reduces_lot_and_resets_protections(executor
     assert run_signal(executor, store, d)["status"] == "done"
     assert sorted((c["trigger_price"], c["qty"]) for c in paper.open_conditional_orders(1)) == \
         [(85000.0, 0.004), (87000.0, 0.002), (88000.0, 0.002)]
-    lot_inst = store.get_lot("test", pid)["opened_at_ms"]
+    lot_inst = store.get_lot("test", "bybit", pid)["opened_at_ms"]
     seq = last_seq(store, "test")
 
     fired = paper.set_price(87000)
@@ -513,7 +513,7 @@ def test_take_profit_partial_trigger_reduces_lot_and_resets_protections(executor
     snap = executor.snapshot_now("test")
     assert snap is not None
 
-    lot = store.get_lot("test", pid)
+    lot = store.get_lot("test", "bybit", pid)
     assert lot["status"] == "open" and lot["qty"] == pytest.approx(0.002)
     assert lot["protection_orders"]["tp_done"] == [0]
     # 남은 수량으로 SL + TP[1] 재설정 (완료된 TP[0] 은 다시 만들지 않는다)
@@ -542,8 +542,8 @@ def test_reconcile_mismatch_sets_inconsistent_and_skips_snapshot(executor, store
     assert paper.positions()[2]["size"] == pytest.approx(0.003)
 
     assert executor.reconcile("test") is False
-    assert store.is_inconsistent("test") is True
-    assert "idx2" in store.get_meta("inconsistent_note:test", "")
+    assert store.is_inconsistent("test", "bybit") is True
+    assert "idx2" in store.get_meta("inconsistent_note:test:bybit", "")
     assert alerts.contains("RECONCILE_REQUIRED")
     assert executor.snapshot_now("test") is None
     assert reports_after(store, "test", seq) == []        # 스냅샷 생략
@@ -557,7 +557,7 @@ def test_reconcile_mismatch_sets_inconsistent_and_skips_snapshot(executor, store
     row = run_signal(executor, store, make_signal(position_id=pid, event_sequence=3, action="partial_exit",
                                                   qty_btc=0.001, expected_qty_btc_after=0.001, reference_price=None))
     assert row["status"] == "done"
-    assert store.get_lot("test", pid)["qty"] == pytest.approx(0.001)
+    assert store.get_lot("test", "bybit", pid)["qty"] == pytest.approx(0.001)
     snaps = [r for r in reports_after(store, "test", seq) if r["kind"] == "snapshot"]
     assert snaps == []                                     # 여전히 불일치 → 스냅샷 없음
 
@@ -565,7 +565,7 @@ def test_reconcile_mismatch_sets_inconsistent_and_skips_snapshot(executor, store
     paper.place_market("Buy", 0.001, 2, True, "manual-fix")
     seq = last_seq(store, "test")
     assert executor.reconcile("test") is True
-    assert store.is_inconsistent("test") is False
+    assert store.is_inconsistent("test", "bybit") is False
     snap = executor.snapshot_now("test")
     assert snap is not None
     rs = reports_after(store, "test", seq)

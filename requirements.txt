@@ -3,3 +3,4 @@ uvicorn[standard]>=0.30
 pydantic>=2.7
 pybit>=5.16.0
 httpx>=0.27
+python-okx>=0.4

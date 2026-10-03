@@ -125,7 +125,7 @@ def test_fill_status_requires_qty_price_fill_id(reporter, store):
             reporter.execution("test", **IDENT, action="entry", status="filled", order_id="o", **kw)
     with pytest.raises(ReportError):
         reporter.execution("test", **IDENT, action="entry", status="filled", qty=0, fill_price=1.0, fill_id="f")
-    assert store.pending_reports("test") == []      # 실패한 호출은 sequence 를 소비하지 않는다
+    assert store.pending_reports("test", "bybit") == []      # 실패한 호출은 sequence 를 소비하지 않는다
     assert reporter.execution("test", **IDENT, action="entry", status="filled", qty=0.001, fill_price=1.0,
                               fill_id="f")["sequence"] == 1
 
@@ -185,7 +185,7 @@ def test_snapshot_body_matches_contract(reporter):
          "qty": 0.003, "entry_price": 85000, "mark_price": 85950, "stop_loss": 84000, "take_profit": 90000,
          "updated_at_ms": obs - 1},
     ]
-    alloc = reporter.snapshot("test", positions, observed_at_ms=obs)
+    alloc = reporter.snapshot("test", "bybit", positions, observed_at_ms=obs)
     b = _body(alloc)
     _header_ok(b, "test", "snapshot")
     assert set(b) == HEADER_KEYS | {"complete", "account_scope", "positions"}
@@ -207,7 +207,7 @@ def test_snapshot_body_matches_contract(reporter):
 
 
 def test_empty_snapshot_is_confirmed_flat(reporter):
-    b = _body(reporter.snapshot("test", [], observed_at_ms=now_ms()))
+    b = _body(reporter.snapshot("test", "bybit", [], observed_at_ms=now_ms()))
     assert b["positions"] == [] and b["complete"] is True
 
 
@@ -216,23 +216,23 @@ def test_snapshot_rejects_contract_violations(reporter, store):
             "entry_price": 85000, "mark_price": None, "stop_loss": None, "take_profit": None, "updated_at_ms": now_ms()}
     obs = now_ms()
     with pytest.raises(ReportError):
-        reporter.snapshot("test", [dict(good, qty=0)], observed_at_ms=obs)
+        reporter.snapshot("test", "bybit", [dict(good, qty=0)], observed_at_ms=obs)
     with pytest.raises(ReportError):
-        reporter.snapshot("test", [dict(good, entry_price=None)], observed_at_ms=obs)
+        reporter.snapshot("test", "bybit", [dict(good, entry_price=None)], observed_at_ms=obs)
     with pytest.raises(ReportError):
-        reporter.snapshot("test", [good, dict(good)], observed_at_ms=obs)            # position_id 중복
+        reporter.snapshot("test", "bybit", [good, dict(good)], observed_at_ms=obs)            # position_id 중복
     with pytest.raises(ReportError):
-        reporter.snapshot("test", [good, dict(good, position_id="p2", position_idx=0)], observed_at_ms=obs)  # 0 과 1 혼용
+        reporter.snapshot("test", "bybit", [good, dict(good, position_id="p2", position_idx=0)], observed_at_ms=obs)  # 0 과 1 혼용
     with pytest.raises(ReportError):
-        reporter.snapshot("test", [dict(good, leg="short")], observed_at_ms=obs)    # idx1 → long
+        reporter.snapshot("test", "bybit", [dict(good, leg="short")], observed_at_ms=obs)    # idx1 → long
     with pytest.raises(ReportError):
-        reporter.snapshot("test", [dict(good, take_profit=[1.0] * 21)], observed_at_ms=obs)
+        reporter.snapshot("test", "bybit", [dict(good, take_profit=[1.0] * 21)], observed_at_ms=obs)
     with pytest.raises(ReportError):
-        reporter.snapshot("test", [dict(good, stop_loss=-1)], observed_at_ms=obs)
+        reporter.snapshot("test", "bybit", [dict(good, stop_loss=-1)], observed_at_ms=obs)
     with pytest.raises(ReportError):   # 단방향(idx 0) 에 롱/숏 동시 보유
-        reporter.snapshot("test", [dict(good, position_idx=0), dict(good, position_id="p2", position_idx=0, leg="short")],
+        reporter.snapshot("test", "bybit", [dict(good, position_idx=0), dict(good, position_id="p2", position_idx=0, leg="short")],
                           observed_at_ms=obs)
-    assert store.pending_reports("test") == []
+    assert store.pending_reports("test", "bybit") == []
 
 
 # --------------------------------------------------------------------------- #
@@ -240,12 +240,12 @@ def test_snapshot_rejects_contract_violations(reporter, store):
 # --------------------------------------------------------------------------- #
 def test_sequence_is_contiguous_and_per_mode(reporter, store):
     seqs = [_ack(reporter)["sequence"] for _ in range(3)]
-    seqs.append(reporter.snapshot("test", [], observed_at_ms=now_ms())["sequence"])
+    seqs.append(reporter.snapshot("test", "bybit", [], observed_at_ms=now_ms())["sequence"])
     assert seqs == [1, 2, 3, 4]
     assert _ack(reporter, mode="live")["sequence"] == 1
     assert _ack(reporter, mode="live")["sequence"] == 2
     assert _ack(reporter)["sequence"] == 5
-    ids = [r["report_id"] for r in store.pending_reports("test")]
+    ids = [r["report_id"] for r in store.pending_reports("test", "bybit")]
     assert len(ids) == len(set(ids)) == 5
 
 
@@ -263,7 +263,7 @@ def test_sequence_persists_across_restart(settings, alerts, fake_client):
         alloc = _ack(r2)
         assert alloc["sequence"] == 4
         assert _body(alloc)["observed_at_ms"] >= obs_last
-        assert len(store2.pending_reports("test")) == 4
+        assert len(store2.pending_reports("test", "bybit")) == 4
     finally:
         store2.close()
 
@@ -276,7 +276,7 @@ def test_observed_at_ms_is_monotonic_and_not_after_ts(reporter):
     assert b2["observed_at_ms"] == t0
     b3 = _body(_ack(reporter, observed_at_ms=now_ms() + 60_000))  # 미래 → ts 로 클램프
     assert b3["observed_at_ms"] == b3["ts"]
-    b4 = _body(reporter.snapshot("test", [], observed_at_ms=t0))  # 스냅샷도 같은 스트림
+    b4 = _body(reporter.snapshot("test", "bybit", [], observed_at_ms=t0))  # 스냅샷도 같은 스트림
     assert b4["observed_at_ms"] >= b3["observed_at_ms"]
     with pytest.raises(ReportError):
         _ack(reporter, observed_at_ms=0)

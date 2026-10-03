@@ -1,14 +1,21 @@
-"""거래소 래퍼 (ARCHITECTURE.md §4).
+"""거래소 래퍼 (ARCHITECTURE.md §4, ARCHITECTURE_MULTI_EXCHANGE.md §3).
 
-두 구현이 같은 인터페이스(`ExchangeBase`)를 가진다.
-  - BybitExchange : pybit `unified_trading.HTTP` 를 감싼 실거래소 래퍼 (linear, 단일 심볼).
-  - PaperExchange : 메모리 시뮬레이터 (테스트 / `test_simulate_fills`).
+모든 구현이 같은 인터페이스(`ExchangeBase`)를 가진다. 생성자는 `config.AccountSettings` 하나를 받는다.
+  - BybitExchange  : pybit `unified_trading.HTTP` 를 감싼 실거래소 래퍼 (linear, 단일 심볼).
+  - PaperExchange  : 메모리 시뮬레이터 (테스트 / `test_simulate_fills`). 계정마다 하나씩, display_name 은 계정 거래소.
+  - OkxExchange / ToobitExchange : 별도 모듈(exchange_okx / exchange_toobit). `build_exchange` 가 지연 import 한다.
+
+공통 추가(2단계)
+  - `display_name` ("Bybit"|"OKX"|"Toobit"), `supports_lot_protection` (lot 단위 조건부 주문 가능 여부),
+    `set_position_protection(position_idx, stop_loss, take_profit)` (포지션 단위 TP/SL; lot 보호를 못 쓰는 거래소용),
+    `account` (AccountSettings).
+  - 수량은 항상 BTC 단위로 주고받는다. 계약 수 변환은 각 래퍼 안에서만 한다.
 
 규칙
   - 수량·가격은 float 로 받고, 문자열 변환은 내부에서 `util.fmt_step` 으로만 한다.
   - 거래소 예외 원문은 WARNING 로그에 200자 절단으로만 남기고, 호출자에게는
     `ExchangeError.code` / `ExchangeRejected.ret_code` 만 전달한다.
-  - import 시 부작용 없음 (HTTP 세션은 BybitExchange 생성 시에만 만든다).
+  - import 시 부작용 없음 (HTTP 세션은 실거래소 래퍼 생성 시에만 만든다).
 """
 from __future__ import annotations
 
@@ -17,9 +24,24 @@ import threading
 import time
 from typing import Any, Callable
 
+from .config import EXCHANGE_DISPLAY, AccountSettings, Settings
 from .util import floor_step, fmt_step, now_ms, round_tick
 
 log = logging.getLogger("lake_executor.exchange")
+
+
+def _as_account(obj) -> AccountSettings:
+    """AccountSettings 또는 1단계 호출 호환용 Settings(→ accounts[0]) 를 AccountSettings 로."""
+    if isinstance(obj, AccountSettings):
+        return obj
+    if isinstance(obj, Settings):
+        if not obj.accounts:
+            raise ValueError("settings has no accounts")
+        return obj.accounts[0]
+    accts = getattr(obj, "accounts", None)   # Settings 호환 덕타이핑 (테스트 더블)
+    if accts:
+        return _as_account(accts[0])
+    raise TypeError(f"expected AccountSettings or Settings, got {type(obj).__name__}")
 
 _LOG_TRUNC = 200
 
@@ -58,7 +80,15 @@ class ExchangeRejected(ExchangeError):
 # 공통 인터페이스
 # --------------------------------------------------------------------------- #
 class ExchangeBase:
-    name: str = "base"
+    name: str = "base"                      # 구현 종류: bybit | okx | toobit | paper
+    display_name: str = "Bybit"             # 회신 본문 exchange 값: Bybit | OKX | Toobit
+    supports_lot_protection: bool = True    # False 면 실행기는 place_conditional 대신 set_position_protection 을 쓴다
+    account: AccountSettings | None = None
+
+    def set_position_protection(self, position_idx: int, stop_loss: float | None, take_profit: float | None) -> dict:
+        """포지션(레그) 단위 TP/SL 설정. None 은 해제. 한 레그의 모든 lot 에 같은 값이 적용된다.
+        → {"position_idx","stop_loss","take_profit"}. lot 보호를 지원하는 거래소는 구현하지 않는다."""
+        raise NotImplementedError(f"{self.name} does not implement position-level protection")
 
     def instrument(self) -> dict:
         """{"qty_step","min_qty","max_qty","tick"} (캐시)."""
@@ -146,28 +176,30 @@ _MARGIN_MODE_MAP = {"isolated": "ISOLATED_MARGIN", "cross": "REGULAR_MARGIN"}
 class BybitExchange(ExchangeBase):
     """Bybit v5 (pybit) 래퍼. 단일 category/symbol."""
 
-    name = "bybit"
     http_timeout_s: int = 10
     read_attempts: int = 2
     read_retry_sleep_s: float = 0.3
 
-    def __init__(self, settings, http=None):
-        self.settings = settings
-        self.category = settings.category
-        self.symbol = settings.symbol
+    name = "bybit"
+    display_name = "Bybit"
+    supports_lot_protection = True
+
+    def __init__(self, account, http=None):
+        """account: config.AccountSettings (키는 account.api_key/api_secret). 1단계 호환으로 Settings 도 받는다."""
+        self.account = _as_account(account)
+        self.settings = self.account     # 하위 호환 속성명 (allowed_position_idx 등 같은 메서드를 가진다)
+        self.category = self.account.category
+        self.symbol = self.account.symbol
         self._instr: dict | None = None
         self._lock = threading.Lock()
         if http is not None:
             self.http = http  # 테스트 주입용 (pybit HTTP 호환 객체)
         else:
             from pybit.unified_trading import HTTP  # 지연 import: 모듈 import 부작용 최소화
-            kw: dict[str, Any] = {"testnet": bool(settings.testnet), "timeout": self.http_timeout_s}
-            sec = getattr(settings, "secrets", None)
-            key = getattr(sec, "bybit_api_key", "") or ""
-            secret = getattr(sec, "bybit_api_secret", "") or ""
-            if key and secret:
-                kw["api_key"] = key
-                kw["api_secret"] = secret
+            kw: dict[str, Any] = {"testnet": bool(self.account.testnet), "timeout": self.http_timeout_s}
+            if self.account.api_key and self.account.api_secret:
+                kw["api_key"] = self.account.api_key
+                kw["api_secret"] = self.account.api_secret
             self.http = HTTP(**kw)
 
     # ----- 예외 매핑 -------------------------------------------------------
@@ -448,6 +480,13 @@ class BybitExchange(ExchangeBase):
 # Paper (메모리 시뮬레이터)
 # --------------------------------------------------------------------------- #
 _DEFAULT_PAPER_INSTRUMENT = {"qty_step": 0.001, "min_qty": 0.001, "max_qty": 100.0, "tick": 0.1}
+# 거래소별 Paper 기본 instrument (BTC 단위) — test(simulate_fills) 가 live 의 최소 수량 규칙을 그대로 흉내 내도록
+# (OKX: ctVal 0.01 × lotSz 1 = 0.01 BTC / Toobit: contractMultiplier 0.001 × stepSize 1 = 0.001 BTC / Bybit: qtyStep 0.001).
+PAPER_INSTRUMENTS: dict[str, dict] = {
+    "bybit": dict(_DEFAULT_PAPER_INSTRUMENT),
+    "okx": {"qty_step": 0.01, "min_qty": 0.01, "max_qty": 100.0, "tick": 0.1},
+    "toobit": {"qty_step": 0.001, "min_qty": 0.001, "max_qty": 100.0, "tick": 0.1},
+}
 
 
 class PaperExchange(ExchangeBase):
@@ -456,15 +495,24 @@ class PaperExchange(ExchangeBase):
     - 시장가: 현재가에 즉시 전량 체결 (order id "porder-N", exec id "pexec-N").
     - 조건부: `set_price(p)` 에서 trigger_direction 1 → p >= trigger, 2 → p <= trigger 이면 체결.
     - reduceOnly 는 포지션 크기만큼만 체결(포지션 없으면 110017 거부). 추가 시 평균가 가중 갱신.
+    - `lot_protection=False` 면 lot 보호(조건부 주문)를 지원하지 않는 거래소(Toobit 등)를 흉내 낸다:
+      `place_conditional` 은 NotImplementedError, `set_position_protection(idx, sl, tp)` 가 포지션 단위 SL/TP 를 저장하고
+      `set_price` 에서 조건을 만족하면 그 idx 포지션 **전량**을 reduceOnly 시장가(주문 "pprot-N", link "pp:<idx>:<n>")
+      로 닫는다. 발동 기록은 `protection_events` 에 쌓인다.
     - 스레드 안전(RLock). 상태는 `reset()` 으로 초기화.
     """
 
     name = "paper"
 
-    def __init__(self, settings, price: float = 85000.0, instrument: dict | None = None, clock=None):
-        self.settings = settings
-        self.category = getattr(settings, "category", "linear")
-        self.symbol = getattr(settings, "symbol", "BTCUSDT")
+    def __init__(self, account, price: float = 85000.0, instrument: dict | None = None, clock=None, *,
+                 lot_protection: bool = True):
+        """account: config.AccountSettings (display_name 은 account.exchange 를 따른다). 1단계 호환으로 Settings 도 받는다."""
+        self.account = _as_account(account)
+        self.settings = self.account     # 하위 호환 속성명
+        self.display_name = EXCHANGE_DISPLAY.get(self.account.exchange, "Bybit")
+        self.supports_lot_protection = bool(lot_protection)
+        self.category = self.account.category
+        self.symbol = self.account.symbol
         self._instr = dict(instrument or _DEFAULT_PAPER_INSTRUMENT)
         self._clock: Callable[[], int] = clock or now_ms
         self._lock = threading.RLock()
@@ -476,7 +524,10 @@ class PaperExchange(ExchangeBase):
         self._execs: dict[str, list[dict]] = {}     # order_id -> executions
         self._order_seq = 0
         self._exec_seq = 0
+        self._prot_seq = 0
         self.account_setup: dict | None = None
+        self.position_protections: dict[int, dict] = {}   # position_idx -> {"stop_loss","take_profit"}
+        self.protection_events: list[dict] = []           # 포지션 단위 보호 발동 기록
 
     # ----- 테스트/운영 편의 ---------------------------------------------------
     def reset(self, price: float | None = None) -> None:
@@ -490,6 +541,9 @@ class PaperExchange(ExchangeBase):
             self._execs.clear()
             self._order_seq = 0
             self._exec_seq = 0
+            self._prot_seq = 0
+            self.position_protections.clear()
+            self.protection_events.clear()
 
     def set_price(self, price: float, mark: float | None = None) -> list[dict]:
         """시세 갱신. 트리거된 조건부 주문을 체결하고 그 주문(get_order 형식) 목록을 돌려준다."""
@@ -499,7 +553,9 @@ class PaperExchange(ExchangeBase):
         with self._lock:
             self._price = p
             self._mark = float(mark) if mark is not None else None
-            return self._trigger_conditionals(p)
+            fired = self._trigger_conditionals(p)
+            fired.extend(self._trigger_position_protections(p))
+            return fired
 
     def all_orders(self) -> list[dict]:
         with self._lock:
@@ -550,6 +606,8 @@ class PaperExchange(ExchangeBase):
 
     def place_conditional(self, side: str, qty: float, position_idx: int, trigger_price: float,
                           trigger_direction: int, order_link_id: str, trigger_by: str) -> dict:
+        if not self.supports_lot_protection:
+            raise NotImplementedError("this paper exchange simulates an exchange without lot-level conditional orders")
         if int(trigger_direction) not in (1, 2):
             raise ValueError("trigger_direction must be 1 or 2")
         tp = round_tick(float(trigger_price), self._instr["tick"])
@@ -593,15 +651,77 @@ class PaperExchange(ExchangeBase):
                 if o["kind"] == "conditional" and o["status"] == "Untriggered" and o["position_idx"] == int(position_idx)
             ]
 
+    # ----- 포지션 단위 보호 (lot_protection=False 시뮬레이션) --------------------
+    def set_position_protection(self, position_idx: int, stop_loss: float | None, take_profit: float | None) -> dict:
+        """idx 포지션의 SL/TP 를 설정(None = 해제). 둘 다 None 이면 포지션이 없어도 해제만 한다.
+        Bybit 조건부와 같은 규칙으로, 현재가가 이미 지난 가격은 10001 'already crossed' 로 거부한다."""
+        if self.supports_lot_protection:
+            # lot 보호를 지원하는 거래소(Bybit 시뮬레이션)에서는 호출 자체가 실행기 버그 → Bybit 래퍼와 같은 예외
+            raise NotImplementedError("paper exchange with lot protection does not implement position-level protection")
+        idx = int(position_idx)
+        if idx not in self._allowed_idx():
+            raise ExchangeRejected(ret_code=10001, message="position idx not match position mode")
+        tick = self._instr["tick"]
+        sl = round_tick(float(stop_loss), tick) if stop_loss is not None else None
+        tp = round_tick(float(take_profit), tick) if take_profit is not None else None
+        with self._lock:
+            if sl is None and tp is None:
+                self.position_protections.pop(idx, None)
+                return {"position_idx": idx, "stop_loss": None, "take_profit": None}
+            pos = self._positions.get(idx)
+            if pos is None or pos["size"] <= 0:
+                raise ExchangeRejected(ret_code=110017, message="no position to protect")
+            long = pos["side"] == "Buy"
+            if (sl is not None and sl <= 0) or (tp is not None and tp <= 0):
+                raise ExchangeRejected(ret_code=10001, message="protection price must be > 0")
+            p = self._price
+            if sl is not None and ((long and p <= sl) or (not long and p >= sl)):
+                raise ExchangeRejected(ret_code=10001, message="stop loss already crossed by current price")
+            if tp is not None and ((long and p >= tp) or (not long and p <= tp)):
+                raise ExchangeRejected(ret_code=10001, message="take profit already crossed by current price")
+            self.position_protections[idx] = {"stop_loss": sl, "take_profit": tp}
+            return {"position_idx": idx, "stop_loss": sl, "take_profit": tp}
+
+    def get_position_protection(self, position_idx: int) -> dict | None:
+        with self._lock:
+            v = self.position_protections.get(int(position_idx))
+            return dict(v) if v else None
+
+    def _trigger_position_protections(self, p: float) -> list[dict]:
+        fired: list[dict] = []
+        for idx in sorted(list(self.position_protections)):
+            prot = self.position_protections[idx]
+            pos = self._positions.get(idx)
+            if pos is None or pos["size"] <= 0:
+                del self.position_protections[idx]
+                continue
+            long = pos["side"] == "Buy"
+            sl, tp = prot.get("stop_loss"), prot.get("take_profit")
+            kind = None
+            if sl is not None and ((long and p <= sl) or (not long and p >= sl)):
+                kind = "sl"
+            elif tp is not None and ((long and p >= tp) or (not long and p <= tp)):
+                kind = "tp"
+            if kind is None:
+                continue
+            self._prot_seq += 1
+            link = f"pp:{idx}:{self._prot_seq}"
+            o = self._new_order(link, "Sell" if long else "Buy", pos["size"], idx, True, kind="position_protection",
+                                trigger_price=sl if kind == "sl" else tp)
+            self._execute(o, p)   # 전량 reduceOnly 체결 → 포지션 소멸
+            del self.position_protections[idx]
+            out = self._out_order(o)
+            self.protection_events.append({"position_idx": idx, "kind": kind, "price": p, "qty": o["qty"],
+                                           "order_id": o["order_id"], "order_link_id": link, "exec_time_ms": o["updated_time_ms"]})
+            fired.append(out)
+        return fired
+
     # ----- 내부 --------------------------------------------------------------
     def _allowed_idx(self) -> set[int]:
-        fn = getattr(self.settings, "allowed_position_idx", None)
-        if callable(fn):
-            try:
-                return set(fn())
-            except Exception:  # noqa: BLE001
-                pass
-        return {0, 1, 2}
+        try:
+            return set(self.account.allowed_position_idx())
+        except Exception:  # noqa: BLE001
+            return {0, 1, 2}
 
     def _validate_new_order(self, side: str, qty: float, position_idx: int, order_link_id: str) -> float:
         if side not in ("Buy", "Sell"):
@@ -719,11 +839,22 @@ class PaperExchange(ExchangeBase):
 # --------------------------------------------------------------------------- #
 # 팩토리
 # --------------------------------------------------------------------------- #
-def build_exchange(settings, kind: str, price: float | None = None) -> ExchangeBase:
-    """kind: "bybit" | "paper". paper 의 초기가는 price (기본 85000.0)."""
-    k = (kind or "").lower()
-    if k == "bybit":
-        return BybitExchange(settings)
+def build_exchange(account, kind: str | None = None, price: float | None = None) -> ExchangeBase:
+    """account: AccountSettings (1단계 호환: Settings 를 주면 accounts[0]).
+    kind: None → account.exchange | "paper" | "bybit" | "okx" | "toobit". paper 의 초기가는 price (기본 85000.0).
+    okx/toobit 래퍼는 별도 모듈에서 지연 import 한다 (이 모듈은 그 모듈들 없이도 import 된다)."""
+    acct = _as_account(account)
+    k = (kind or acct.exchange or "").lower()
     if k == "paper":
-        return PaperExchange(settings, price=85000.0 if price is None else float(price))
+        # 계정 거래소의 최소 수량/step 을 그대로 쓴다 (test 결과가 live 의 QTY_BELOW_MIN 판정을 예측하도록)
+        instr = PAPER_INSTRUMENTS.get(str(acct.exchange or "").lower())
+        return PaperExchange(acct, price=85000.0 if price is None else float(price), instrument=instr)
+    if k == "bybit":
+        return BybitExchange(acct)
+    if k == "okx":
+        from .exchange_okx import OkxExchange  # 지연 import (병렬 구현 모듈)
+        return OkxExchange(acct)
+    if k == "toobit":
+        from .exchange_toobit import ToobitExchange  # 지연 import (병렬 구현 모듈)
+        return ToobitExchange(acct)
     raise ValueError(f"unknown exchange kind: {kind}")

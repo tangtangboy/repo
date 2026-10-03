@@ -60,11 +60,20 @@ python deploy/provision.py
   ```
 - 이미 `aws_state.json` 에 `instance_id` 가 있으면 중복 생성을 막기 위해 바로 종료한다.
 
-## 2. Bybit API 키 준비
+## 2. 거래소 API 키 준비 (Bybit 필수, OKX/Toobit 은 계정을 켤 때)
 
-- lake 전용 **서브계정** 권장. 권한: 통합거래(UTA) **주문·포지션 읽기/쓰기**, **출금 없음**.
-- **IP 제한 = 위 Elastic IP** (서버에서만 작동, 로컬에서는 `check` 가 실패하는 게 정상).
-- 계정은 USDT 무기한 BTCUSDT 를 **헤지 모드**로 쓴다 (서비스 시작 시 `ensure_account_setup` 이 맞춘다).
+공통: lake 전용 **서브계정**, 권한은 **선물 주문·포지션 읽기/쓰기** 만(**출금·이체 없음**), **IP 제한 = 위 Elastic IP** 한 개
+(서버에서만 작동, 로컬에서는 `check` 가 거래소 단계에서 실패하는 게 정상). 모든 계정은 **헤지 모드**로 쓴다(서비스 시작 시
+`ensure_account_setup` 이 맞추므로 첫 기동은 포지션 없는 상태에서). 상세·검증 순서는 `docs/RUNBOOK.md` §6.
+
+| 거래소 | `.env` 키 | 비고 |
+|---|---|---|
+| Bybit | `BYBIT_API_KEY` / `BYBIT_API_SECRET` | UTA, Contract 주문·포지션 읽기/쓰기. USDT 무기한 BTCUSDT |
+| OKX | `OKX_API_KEY` / `OKX_API_SECRET` / `OKX_API_PASSPHRASE` | 권한 Trade+Read. **passphrase 필수**. `testnet:true` 는 데모 트레이딩(데모 전용 키 따로 발급) |
+| Toobit | `TOOBIT_API_KEY` / `TOOBIT_API_SECRET` | USDT-M 선물, LONG/SHORT 양방향 포지션 전용. 테스트넷 없음(소액 실계정으로 검증) |
+
+`config.json` 의 `accounts[]` 에서 계정을 켠다(`enabled`). 예시 파일은 bybit 만 켜져 있고 OKX/Toobit 은 꺼져 있다.
+접두사는 `accounts[].env_prefix` 로 바꿀 수 있다(예: `OKX_SUB_API_KEY`).
 
 ## 3. 소스 업로드 + 서버 설정 — `push.py`
 
@@ -90,11 +99,14 @@ python deploy/push.py
 copy .env.example .env
 copy config.example.json config.json
 ```
-- `.env`: `BYBIT_API_KEY/SECRET`, `LAKE_SIGNAL_SECRET_TEST/LIVE`(수신 검증, 32바이트 이상),
-  `LAKE_REPORT_SECRET_TEST/LIVE` + `LAKE_REPORT_URL_TEST/LIVE`(회신), `ADMIN_TOKEN`(32바이트 이상,
+- `.env`: `BYBIT_API_KEY/SECRET`(+ 켤 계정의 `OKX_API_KEY/SECRET/PASSPHRASE`, `TOOBIT_API_KEY/SECRET`),
+  `LAKE_SIGNAL_SECRET_TEST/LIVE`(수신 검증, 32바이트 이상), `LAKE_REPORT_SECRET_TEST/LIVE` + `LAKE_REPORT_URL_TEST/LIVE`(회신 기본값;
+  계정별 덮어쓰기 `LAKE_REPORT_URL_{MODE}_{NAME}` / `LAKE_REPORT_SECRET_{MODE}_{NAME}`), `ADMIN_TOKEN`(32바이트 이상,
   `python -c "import secrets;print(secrets.token_urlsafe(32))"`), (선택) 텔레그램.
 - `config.json`: 처음엔 `"live": {"enabled": false}` 로 두고 TEST 모드부터. `"test": {"simulate_fills": true}` 로 하면
-  TEST 신호를 PaperExchange 로 체결시켜 회신·스냅샷 흐름까지 확인할 수 있다 (실거래소 호출 없음).
+  TEST 신호를 계정별 PaperExchange 로 체결시켜 회신·스냅샷 흐름까지 확인할 수 있다 (실거래소 호출 없음).
+  `accounts[]` 는 bybit 만 `enabled:true`, `report:true` 로 시작한다. OKX/Toobit 은 `docs/RUNBOOK.md` §6.0 순서로 한 계정씩 켠다.
+  `accounts` 키를 지우면 v0.1 과 같은 단일 bybit 설정이다.
 - 실거래 전환은 **lake 와 TEST 왕복이 끝난 뒤** `live.enabled=true` 로 바꾸고 다시 `finalize.py`.
 
 ## 5. 기동 — `finalize.py`
@@ -105,7 +117,10 @@ python deploy/finalize.py
 순서: 소스 동기화 + `.env`/`config.json` 업로드(`chmod 600`) → `python -m lake_executor check`(읽기 전용, 주문 없음)
 → 통과 시 `systemctl enable --now lake-executor` + restart, `systemctl restart caddy` → `is-active`, `journalctl -n 30`, `/healthz` 출력.
 
-- `check` 가 실패하면 서비스를 켜지 않는다. 흔한 원인: Bybit 키 IP 화이트리스트 누락, 시크릿 길이 < 32, 회신 URL 오타.
+- `check` 가 실패하면 서비스를 켜지 않는다. 흔한 원인: Bybit 키 IP 화이트리스트 누락, 시크릿 길이 < 32, 회신 URL 오타,
+  OKX 키는 있는데 `OKX_API_PASSPHRASE` 누락, Toobit 계정에 `position_mode` 가 `hedge` 가 아님(설정 오류 exit 2).
+  `check` 는 실키가 있는 모든 계정(Bybit/OKX/Toobit)에 대해 읽기 전용으로 instrument·시세·포지션을 읽으므로 키·IP 화이트리스트
+  문제가 여기서 드러난다; 기동 후에는 `/state` 의 `accounts.{name}.modes.live.exchange_positions` 로 한 번 더 확인한다.
 - HTTPS 인증서는 Caddy 가 첫 요청/기동 때 발급한다 (보통 1분 이내). 외부 `healthz` 가 바로 안 뜨면 잠시 후:
   ```powershell
   python deploy/ssh_run.py "curl -s https://3-xx-xx-xx.sslip.io/healthz"
@@ -142,7 +157,7 @@ python deploy/ssh_run.py "cd /home/ubuntu/lake-executor && ./.venv/bin/python -m
 - **인스턴스 정지(요금 절약)** — AWS 콘솔 또는 `aws ec2 stop-instances --instance-ids <id>`.
   Elastic IP 는 유지되므로 다시 시작해도 IP·URL 그대로. (정지 중에도 EIP 는 소액 과금)
 - 포지션을 실제로 닫는 건 이 봇이 아니라 **lake 의 full_exit 신호** 또는 수동(Bybit 앱)이다.
-  수동으로 닫았다면 봇의 lot 원장과 어긋나 `RECONCILE_REQUIRED` 가 날 수 있다 → `POST /admin/reconcile?mode=live`.
+  수동으로 닫았다면 봇의 lot 원장과 어긋나 `RECONCILE_REQUIRED` 가 날 수 있다 → `POST /admin/reconcile?mode=live&account=<name>` (`account` 생략 = 모든 계정).
 
 ## 7. 자체 도메인 사용 (sslip.io 대신)
 
@@ -165,13 +180,16 @@ python deploy/ssh_run.py "cd /home/ubuntu/lake-executor && ./.venv/bin/python -m
 | `provision.py` 가 `aws_state.json already has instance` 로 종료 | 이미 만들어짐. 새로 만들려면 AWS 에서 인스턴스·EIP·SG·키페어 삭제 후 `aws_state.json`, `.pem` 삭제 |
 | `push.py` 가 계속 `ssh not ready` | 배포 PC 공인 IP 가 바뀜 → AWS 콘솔 SG `lake-executor` 의 22 번 규칙을 현재 IP 로 교체 |
 | `check` 에서 Bybit 인증 실패 | API 키 IP 화이트리스트에 Elastic IP 누락, 또는 키 권한 부족 |
+| 기동 로그에 `okx … rejected` / `toobit … rejected` (인증·서명) | 그 거래소 키 IP 화이트리스트 누락, OKX passphrase 불일치, Toobit `-1021/-1022`(서버 시계 오차·시크릿) |
+| 어떤 계정만 `rejected/QTY_BELOW_MIN` | 그 거래소 최소 수량 미달(OKX 0.01 BTC). `qty_multiplier` 또는 lake 수량 단위 조정 |
+| live 신호가 `ACCOUNT_DISABLED` / `NO_TARGET_ACCOUNT` | 그 계정 `enabled:false` / `by_exchange` 라우팅에 맞는 계정 없음 (`config.json` `accounts`·`routing`) |
 | 외부 `/healthz` 가 안 열림 | 인증서 발급 대기(1분) / DNS 미전파 / SG 80·443 누락. `sudo journalctl -u caddy -n 50 --no-pager` |
 | lake 가 401 받음 | `LAKE_SIGNAL_SECRET_<MODE>` 불일치 또는 시계 오차(±60s). 403 아님에 주의 |
 | lake 가 503 받음 | 해당 mode 의 수신 시크릿이 `.env` 에 없음 |
 | 회신이 `unsent` 로만 쌓임 | `LAKE_REPORT_URL_<MODE>` / `LAKE_REPORT_SECRET_<MODE>` 미설정 |
-| 인스턴스를 재생성했는데 IP 가 바뀜 | EIP 를 재연결(associate) 하면 유지됨. 바뀌었으면 Bybit 화이트리스트·DNS 둘 다 갱신 |
+| 인스턴스를 재생성했는데 IP 가 바뀜 | EIP 를 재연결(associate) 하면 유지됨. 바뀌었으면 **모든 거래소** 키의 화이트리스트·DNS 를 갱신 |
 
 ## 9. 삭제 (전부 정리)
 
 AWS 콘솔(서울 리전)에서 인스턴스 종료 → Elastic IP **릴리스**(안 하면 과금) → 보안그룹 `lake-executor` → 키페어 `lake-executor`.
-로컬에서는 `deploy/aws_state.json`, `deploy/lake-executor-key.pem` 삭제. Bybit 키도 삭제/IP 해제.
+로컬에서는 `deploy/aws_state.json`, `deploy/lake-executor-key.pem` 삭제. 거래소(Bybit/OKX/Toobit) API 키도 삭제/IP 해제.

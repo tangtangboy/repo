@@ -328,7 +328,7 @@ def test_healthz(client, settings, store):
     assert r.status_code == 200
     assert r.json() == {"ok": True, "halted": False, "inconsistent": {"test": False, "live": False},
                         "protection_missing": {"test": 0, "live": 0}}
-    store.set_inconsistent("live", True, "x")
+    store.set_inconsistent("live", "bybit", True, "x")
     os.makedirs(os.path.dirname(settings.halt_file), exist_ok=True)
     with open(settings.halt_file, "w") as f:
         f.write("halt\n")

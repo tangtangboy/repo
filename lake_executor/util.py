@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
@@ -29,6 +30,18 @@ def order_link_id(*parts: str) -> str:
     """Bybit orderLinkId (최대 36자, 영숫자/-/_ 만). 같은 입력 → 같은 ID (멱등 주문)."""
     h = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:32]
     return "lk" + h  # 34자
+
+
+def alnum_only(s: str, max_len: int = 32) -> str:
+    """영숫자만 남기고 max_len 으로 절단 (OKX clOrdId 등 문자 집합이 좁은 거래소 ID 용).
+    같은 입력 → 같은 출력이라 멱등 키로 계속 쓸 수 있다."""
+    return re.sub(r"[^A-Za-z0-9]", "", s or "")[:max_len]
+
+
+def env_suffix(name: str) -> str:
+    """계정 이름 → 환경변수 접미사. 대문자화하고 영숫자가 아닌 문자는 '_' 로 바꾼다
+    (예: "okx-sub" → "OKX_SUB"; LAKE_REPORT_URL_LIVE_OKX_SUB)."""
+    return re.sub(r"[^A-Z0-9]", "_", (name or "").upper())
 
 
 def floor_step(value: float, step: float) -> float:

@@ -63,6 +63,14 @@ def _collect_secrets(settings: Any) -> list[str]:
     for name in ("signal_secret", "report_secret"):
         d = getattr(sec, name, None) or {}
         out.extend(str(v) for v in d.values() if v)
+    # 2단계: 계정별 키/패스프레이즈/회신 시크릿 (OKX_*, TOOBIT_*, LAKE_REPORT_SECRET_{MODE}_{NAME})
+    for acct in getattr(settings, "accounts", None) or []:
+        for name in ("api_key", "api_secret", "api_passphrase"):
+            v = getattr(acct, name, "")
+            if v:
+                out.append(str(v))
+        d = getattr(acct, "report_secret", None) or {}
+        out.extend(str(v) for v in d.values() if v)
     return out
 
 

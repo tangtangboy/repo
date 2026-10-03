@@ -78,6 +78,9 @@ class ReasonCode(str, Enum):
     EXPIRED = "EXPIRED"                       # 실행 시점에 expires_at_ms 경과 (접수 후 지연)
     OPPOSING_LEG = "OPPOSING_LEG"             # 단방향(idx 0) 에서 반대 방향 lot 이 이미 열려 있음
     PROTECTION_FAILED = "PROTECTION_FAILED"   # 체결은 됐으나 보호주문 생성/취소 실패 (reconcile 이 재시도)
+    ACCOUNT_DISABLED = "ACCOUNT_DISABLED"     # 대상 계정이 enabled=false (계정별 run 결과)
+    NO_TARGET_ACCOUNT = "NO_TARGET_ACCOUNT"   # 라우팅 결과 실행할 계정이 하나도 없음 (by_exchange 불일치 등)
+    EXCHANGE_MISMATCH = "EXCHANGE_MISMATCH"   # by_exchange 라우팅에서 신호 exchange 와 계정 거래소 불일치 (계정별 run 결과)
 
 
 def _finite_pos(v, name: str):
@@ -99,7 +102,7 @@ class Signal(BaseModel):
     event_sequence: int = Field(ge=1, le=9007199254740991)
     ts: int = Field(ge=1, le=9007199254740991)
     expires_at_ms: int = Field(ge=1, le=9007199254740991)
-    exchange: Literal["Bybit"]
+    exchange: Literal["Bybit", "OKX", "Toobit"]      # lake 는 현재 Bybit 만 보냄; by_exchange 라우팅은 대소문자 무시
     category: Literal["linear"]
     symbol: str = Field(min_length=1, max_length=32)
     position_id: str = Field(pattern=ID_PATTERN)
@@ -164,6 +167,10 @@ class Signal(BaseModel):
         if self.take_profit is None:
             return None
         return list(self.take_profit)  # type: ignore[arg-type]
+
+    def exchange_key(self) -> str:
+        """config.AccountSettings.exchange 와 비교할 소문자 키 ("bybit" | "okx" | "toobit")."""
+        return str(self.exchange).lower()
 
     def side(self) -> str:
         """진입/추가 방향의 Bybit side."""

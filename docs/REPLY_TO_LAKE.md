@@ -20,7 +20,7 @@
 | `X-Timestamp` | Unix ms. **본문 `ts` 와 정확히 일치**, 수신 시각 ±60초 |
 | 시크릿 선택 | 본문 `mode` 로 TEST/LIVE 키 선택. 해당 모드 키 미설정이면 503 |
 | 본문 | `lake_execution_contract.json` 의 `outgoing_signal_proposal` 스키마 그대로. **정의되지 않은 필드·JSON 중복 키·NaN/Infinity 거부** |
-| 의미 검증 | `exchange:"Bybit"`, `category:"linear"`, `symbol:"BTCUSDT"`; `position_idx` 1→`leg:long`, 2→`leg:short`; `protection_update` 는 `qty_btc:null`, 그 외는 양수; `expires_at_ms ≥ ts` |
+| 의미 검증 | `exchange` ∈ `"Bybit"` \| `"OKX"` \| `"Toobit"`(현재 lake 는 `Bybit` 만 보냄, §10), `category:"linear"`, `symbol:"BTCUSDT"`; `position_idx` 1→`leg:long`, 2→`leg:short`; `protection_update` 는 `qty_btc:null`, 그 외는 양수; `expires_at_ms ≥ ts` |
 | 만료 | 수신 시각 > `expires_at_ms` → 410 |
 | 중복·순서 | `event_id` 영속. 같은 `event_id` 재전송은 200 duplicate(재실행 없음). `position_id` 별 `event_sequence` 가 마지막 값 이하이면 409 |
 | 응답 시간 | 영속 접수 후 5초 안에 응답. 2xx 는 **접수 확인**이며 실행·체결은 회신(§5)으로만 전달 |
@@ -91,7 +91,8 @@
 - **reason_code**(정리된 코드만, 거래소 원문 없음): `LIVE_DISABLED` `OPERATOR_HALT` `POSITION_MODE_MISMATCH` `POSITION_EXISTS`
   `POSITION_NOT_FOUND` `POSITION_CLOSED` `OPPOSING_LEG` `QTY_EXCEEDS_LOT` `QTY_BELOW_MIN` `QTY_LIMIT` `LEG_LIMIT` `SLIPPAGE_GUARD`
   `STALE_PROTECTION_REVISION` `RECONCILE_REQUIRED` `EXPIRED` `EXCHANGE_REJECTED` `EXCHANGE_ERROR` `EXCHANGE_TIMEOUT`
-  `PROTECTION_FAILED` `UNKNOWN_STATE` `STOP_LOSS_TRIGGERED` `TAKE_PROFIT_TRIGGERED`.
+  `PROTECTION_FAILED` `UNKNOWN_STATE` `STOP_LOSS_TRIGGERED` `TAKE_PROFIT_TRIGGERED`, 다거래소(§10) 추가 코드
+  `ACCOUNT_DISABLED` `NO_TARGET_ACCOUNT` `EXCHANGE_MISMATCH`.
 - `EXCHANGE_TIMEOUT`(`error`) 뒤에 거래소에서 체결이 확인되면 같은 `event_id` 로 체결(`filled`) 회신이 **늦게** 나갈 수 있습니다
   (주문을 잃어버리지 않기 위해). 그 뒤 스냅샷이 실제 잔량을 보여 줍니다.
 - lake 응답 처리: 202 → 전송 완료, 200 → duplicate 로 기록, 409 → `conflict` 로 두고 운영자 알림(자동 번호 덮어쓰기 없음),
@@ -168,6 +169,39 @@ lake 대시보드를 대조합니다.
 
 통과 기준: 중복이 새 매매로 처리되지 않음, 거부가 전부 코드로 구분됨, 시뮬레이션 단계에서 스냅샷 잔량 = lake 기대 잔량.
 그 다음 우리 쪽 Bybit 테스트넷 → LIVE 소액 가드 순으로 진행하며, 각 단계 전환은 별도 승인으로 합니다.
+
+## 10. 다거래소 확장(Bybit + OKX + Toobit) — 합의 요청 항목
+
+우리 실행기는 **계정 목록**(Bybit / OKX / Toobit, 각각 lake 전용 서브계정, 모두 헤지 모드)으로 확장됐습니다. lake 신호 규격은
+그대로이고(수량 `qty_btc` 절대 BTC, `symbol:"BTCUSDT"`), 거래소별 계약 수 변환은 우리 쪽에서 합니다. 회신 계약만 아래 세 가지
+확장이 필요합니다. 합의 전까지는 **기본값으로 Bybit 계정만 회신**하고 OKX/Toobit 실행 결과는 우리 쪽에 저장만 합니다.
+
+1. **`exchange` 열거형 확장** — 신호와 회신의 `exchange` 를 `"Bybit" | "OKX" | "Toobit"` 로 받아주세요. 우리는 신호의 `exchange` 를
+   이 세 값으로 검증하고(그 외 400 `SCHEMA`), 회신 본문 `exchange` 에는 **그 회신이 나온 계정의 거래소 이름**을 넣습니다.
+   lake 가 계속 `"Bybit"` 만 보내도 됩니다: 기본 라우팅 `fanout` 은 신호의 `exchange` 와 무관하게 우리 쪽 활성 계정 전부에
+   같은 신호를 실행합니다(계정별 시드 비율 `qty_multiplier` 적용). lake 가 거래소별로 다른 신호를 보내고 싶으면 알려주세요 —
+   `by_exchange` 라우팅으로 바꾸면 `exchange` 와 일치하는 계정에만 실행하고, 일치하는 계정이 없으면 `rejected/NO_TARGET_ACCOUNT`
+   로 회신합니다.
+2. **`account_scope` 계정별 값** — snapshot 의 `account_scope` 는 계정마다 다릅니다: Bybit `"lake_dedicated_BTCUSDT"`(기존 그대로),
+   OKX `"lake_dedicated_OKX_BTCUSDT"`, Toobit `"lake_dedicated_TOOBIT_BTCUSDT"`. 각 스냅샷은 **그 계정 하나의 전체 포지션**
+   (`complete:true`)이며 다른 계정 포지션을 합치지 않습니다. 계약의 `account_scope` 허용값에 이 두 값을 추가해 주세요.
+3. **회신 스트림 분리** — `sequence`·`observed_at_ms` 단조성·`report_id` 는 **(mode, 계정) 스트림마다 독립**입니다
+   (`report_id` 에 계정 이름이 들어가 스트림 간 충돌 없음: `r-{mode}-{account}-{seq}-…`). lake 가 스트림을 구분하는 방식을 골라주세요:
+   - (a) **계정별 회신 URL** — `LAKE_REPORT_URL_{MODE}_{OKX|TOOBIT}` 와 (원하면) 계정별 서명 시크릿. 우리 쪽은 설정만으로 가능합니다.
+   - (b) **같은 URL + `account_scope`/`exchange` 로 구분** — lake 쪽에서 sequence 를 `(mode, account_scope)` 키로 검증해야 합니다.
+     execution 회신에는 `account_scope` 필드가 없으므로 `exchange` 로 구분하게 됩니다(계정이 거래소당 하나일 때만 유일).
+   권장은 (a) 입니다. 어느 쪽이든 Bybit 스트림의 기존 sequence 는 그대로 이어집니다(끊기거나 리셋되지 않음).
+4. **거래소별 차이(참고)** — 한 신호를 여러 계정에 실행하므로 **계정별로 결과가 다를 수 있습니다**(같은 `event_id` 로 Bybit 는 `filled`,
+   OKX 는 `rejected/QTY_BELOW_MIN` 등). 각 회신은 `exchange` 로 어느 계정인지 드러나며, 한 계정의 거부가 다른 계정 실행을 막지 않습니다.
+   - OKX 최소 수량은 **0.01 BTC**(1계약 = 0.01 BTC, 0.01 단위). 그보다 작은 `qty_btc` 는 OKX 계정만 `QTY_BELOW_MIN`.
+   - Toobit 은 포지션 단위 TP/SL 만 쓰므로(lot 단위 조건부 주문 검증 전) 레그에는 SL 하나 + TP 하나만 걸립니다. 같은 레그에 `position_id` 가
+     둘 이상이면 **보호가격이 합쳐져 레그 전체에 적용**되고(마지막으로 설정한 lot 의 값 우선, 그 lot 이 정하지 않은 쪽은 다른 lot 의 값) `take_profit`
+     은 첫 레벨 하나만 반영됩니다. 스냅샷은 그 레그의 모든 `position_id` 에 같은 `stop_loss/take_profit` 을 표시합니다. Toobit 운영 중에는 레그당
+     `position_id` 하나를 권장합니다.
+   - 새 reason_code: `ACCOUNT_DISABLED`(우리 쪽에서 그 계정을 꺼 둠), `NO_TARGET_ACCOUNT`(by_exchange 라우팅 대상 없음),
+     `EXCHANGE_MISMATCH`(by_exchange 에서 계정 거래소 불일치). 기존 코드 처리와 같이 "실행 안 됨" 으로 보시면 됩니다.
+5. **TEST 왕복** — OKX/Toobit 스트림도 §8 과 같은 순서(기록 전용 → 시뮬레이션 → 데모/소액)로 검증합니다. 시뮬레이션 단계에서는
+   세 계정의 스냅샷이 각각 30초마다 나가므로 lake 대시보드가 `account_scope` 별로 분리 표시되는지 확인 부탁드립니다.
 
 ## 9. 참고: 신호 서명 예시
 

@@ -1,9 +1,15 @@
 """pytest 공용 픽스처/헬퍼 (ARCHITECTURE.md §9).
 
 전부 오프라인·결정적이다. 실키/실네트워크는 절대 쓰지 않는다.
-  - settings : 임시 config.json + .env 로 config.load 한 Settings (state_dir 은 tmp_path 안)
-  - store    : 임시 SQLite Store
-  - paper    : PaperExchange (초기가 86000)
+  - settings : 임시 config.json + .env 로 config.load 한 Settings (state_dir 은 tmp_path 안).
+               1단계 형식(accounts 없음) → 계정 'bybit' 하나 (settings.accounts[0]).
+  - store    : 임시 SQLite Store (스키마 v2, 계정 컬럼)
+  - paper    : PaperExchange(settings.accounts[0], 초기가 86000)
+  - paper_exchanges : {account_name: PaperExchange} — 단일 계정이면 {"bybit": paper}
+  - executor : Executor(settings, store, {"test": {account: paper}, "live": {}}, reporter, alerts)
+               (2단계: 모드별 → 계정 이름별 거래소. 실행기 리팩터링 시 이 모양에 맞추거나 여기만 바꾼다)
+  - multi_settings : 3계정(bybit/okx/toobit, 전부 Paper 로 실행, routing fanout) Settings
+  - multi_store / multi_paper_exchanges : 위 설정용 Store 와 계정별 PaperExchange dict
   - fake_client : 회신 전송용 가짜 httpx.Client (posted 본문/헤더 기록, 응답 코드/예외 큐)
   - reporter / alerts / executor / app / client
   - make_signal(**overrides) : 계약 example 기반 유효 신호 dict (fresh ts/expires, 고유 id)
@@ -75,6 +81,16 @@ DEFAULT_ENV: dict[str, str] = {
 }
 
 ALL_SECRETS = (TEST_SIGNAL_SECRET, LIVE_SIGNAL_SECRET, TEST_REPORT_SECRET, LIVE_REPORT_SECRET, ADMIN_TOKEN)
+DEFAULT_ACCOUNT = "bybit"
+
+MULTI_ACCOUNTS: list[dict[str, Any]] = [
+    {"name": "bybit", "exchange": "bybit", "enabled": True, "symbol": "BTCUSDT", "position_mode": "hedge",
+     "leverage": 5, "margin_mode": "isolated", "testnet": False, "env_prefix": "BYBIT", "qty_multiplier": 1.0, "report": True},
+    {"name": "okx", "exchange": "okx", "enabled": True, "symbol": "BTC-USDT-SWAP", "position_mode": "hedge",
+     "leverage": 5, "margin_mode": "isolated", "testnet": False, "env_prefix": "OKX", "qty_multiplier": 1.0, "report": False},
+    {"name": "toobit", "exchange": "toobit", "enabled": True, "symbol": "BTC-SWAP-USDT", "position_mode": "hedge",
+     "leverage": 5, "margin_mode": "isolated", "testnet": False, "env_prefix": "TOOBIT", "qty_multiplier": 1.0, "report": False},
+]
 
 _counter = itertools.count(1)
 _settings_counter = itertools.count(1)
@@ -124,6 +140,12 @@ def settings_factory(tmp_path):
 @pytest.fixture
 def settings(settings_factory):
     return settings_factory()
+
+
+@pytest.fixture
+def multi_settings(settings_factory):
+    """3개 Paper 계정(bybit/okx/toobit, 모두 enabled, routing fanout). 실키 없음 → live 는 LIVE_DISABLED."""
+    return settings_factory(config_overrides={"routing": "fanout", "accounts": [dict(a) for a in MULTI_ACCOUNTS]})
 
 
 # --------------------------------------------------------------------------- #
@@ -184,7 +206,28 @@ def store(settings):
 
 @pytest.fixture
 def paper(settings):
-    return PaperExchange(settings, price=PAPER_PRICE)
+    return PaperExchange(settings.accounts[0], price=PAPER_PRICE)
+
+
+@pytest.fixture
+def paper_exchanges(settings, paper):
+    """계정 이름 → PaperExchange. 단일 계정 설정이면 {"bybit": paper}."""
+    out = {settings.accounts[0].name: paper}
+    for a in settings.accounts[1:]:
+        out[a.name] = PaperExchange(a, price=PAPER_PRICE)
+    return out
+
+
+@pytest.fixture
+def multi_store(multi_settings):
+    s = Store(multi_settings.db_path)
+    yield s
+    s.close()
+
+
+@pytest.fixture
+def multi_paper_exchanges(multi_settings):
+    return {a.name: PaperExchange(a, price=PAPER_PRICE) for a in multi_settings.accounts}
 
 
 @pytest.fixture
@@ -205,8 +248,8 @@ def reporter(settings, store, alerts, fake_client):
 
 
 @pytest.fixture
-def executor(settings, store, paper, reporter, alerts):
-    return Executor(settings, store, {"test": paper, "live": None}, reporter, alerts)
+def executor(settings, store, paper_exchanges, reporter, alerts):
+    return Executor(settings, store, {"test": dict(paper_exchanges), "live": {}}, reporter, alerts)
 
 
 @pytest.fixture
@@ -282,10 +325,10 @@ def run_signal(executor: Executor, store: Store, d: dict) -> dict:
     return row
 
 
-def load_reports(store: Store, mode: str) -> list[dict]:
-    """mode 의 pending 회신 본문을 sequence 순으로 파싱 (전송하지 않은 상태에서 전체 이력 확인용)."""
+def load_reports(store: Store, mode: str, account: str = DEFAULT_ACCOUNT) -> list[dict]:
+    """(mode, account) 의 pending 회신 본문을 sequence 순으로 파싱 (전송하지 않은 상태에서 전체 이력 확인용)."""
     out = []
-    for row in store.pending_reports(mode, limit=10000):
+    for row in store.pending_reports(mode, account, limit=10000):
         body = row["body"]
         if isinstance(body, memoryview):
             body = body.tobytes()
@@ -293,12 +336,12 @@ def load_reports(store: Store, mode: str) -> list[dict]:
     return out
 
 
-def reports_after(store: Store, mode: str, seq: int) -> list[dict]:
-    return [r for r in load_reports(store, mode) if r["sequence"] > seq]
+def reports_after(store: Store, mode: str, seq: int, account: str = DEFAULT_ACCOUNT) -> list[dict]:
+    return [r for r in load_reports(store, mode, account) if r["sequence"] > seq]
 
 
-def last_seq(store: Store, mode: str) -> int:
-    rs = load_reports(store, mode)
+def last_seq(store: Store, mode: str, account: str = DEFAULT_ACCOUNT) -> int:
+    rs = load_reports(store, mode, account)
     return rs[-1]["sequence"] if rs else 0
 
 

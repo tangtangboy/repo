@@ -20,6 +20,13 @@
   - import 시 부작용 없음: create_app(settings, store, services) 로만 앱을 만든다.
 
 services: executor / reporter / alerts 핸들을 담은 간단한 객체 또는 dict (전부 선택).
+
+2단계 (다계정, ARCHITECTURE_MULTI_EXCHANGE.md §6)
+  - 의미 검증: position_idx 는 라우팅 대상 계정들(by_exchange 면 신호 exchange 와 일치하는 enabled 계정, fanout 이면 enabled
+    전부)의 허용 집합 합집합. by_exchange 인데 일치하는 enabled 계정이 없으면 400 NO_TARGET_ACCOUNT (접수하지 않는다).
+  - GET /healthz 의 inconsistent 는 모드별 '어느 계정이든 불일치' (모양 유지), protection_missing 은 모드별 lot 수.
+  - GET /state 는 `accounts` 아래 계정별 섹션(오픈 lot, 거래소 포지션, 최근 run, 회신 상태, inconsistent) 을 더한다.
+  - POST /admin/reconcile?mode=&account= — account 생략 시 그 모드에 거래소가 있는 모든 계정.
 """
 from __future__ import annotations
 
@@ -36,7 +43,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import auth, store as st
+from . import auth, config as config_mod, store as st
 from .schemas import ID_PATTERN, Signal
 from .util import now_ms
 
@@ -200,8 +207,38 @@ def _write_halt(settings: Any, on: bool, note: str = "") -> None:
             pass
 
 
-def _inconsistent_map(store: st.Store) -> dict[str, bool]:
-    return {m: bool(store.is_inconsistent(m)) for m in MODES}
+def _account_names(settings: Any) -> list[str]:
+    accts = getattr(settings, "accounts", None) or []
+    return [a.name for a in accts] or [st.DEFAULT_ACCOUNT]
+
+
+def _inconsistent_map(store: st.Store, settings: Any) -> dict[str, bool]:
+    """모드별 '어느 계정이든 불일치' (1단계 모양 유지)."""
+    names = _account_names(settings)
+    return {m: any(bool(store.is_inconsistent(m, a)) for a in names) for m in MODES}
+
+
+def _inconsistent_notes(store: st.Store, settings: Any) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for m in MODES:
+        parts = []
+        for a in _account_names(settings):
+            note = store.inconsistent_note(m, a)
+            if note:
+                parts.append(f"{a}: {note}")
+        out[m] = "; ".join(parts)
+    return out
+
+
+def _target_accounts_for(settings: Any, sig: Signal) -> list:
+    """의미 검증용 대상 계정: by_exchange 면 신호 exchange 와 일치하는 enabled 계정, fanout 이면 enabled 전부."""
+    route = getattr(settings, "route_accounts", None)
+    if callable(route):
+        try:
+            return list(route(sig.exchange))
+        except Exception:  # noqa: BLE001
+            return []
+    return list(getattr(settings, "accounts", None) or [])
 
 
 def _json(status: int, body: dict) -> JSONResponse:
@@ -267,6 +304,9 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
     signal_path = str(getattr(settings, "signal_path", "/lake/signal") or "/lake/signal")
     max_body = int(getattr(settings, "max_body_bytes", 65536))
     max_skew = int(getattr(settings, "max_clock_skew_ms", 60000))
+    # 신호 symbol 은 lake 표준 심볼 (BTCUSDT). 계정 네이티브 심볼(BTC-USDT-SWAP 등) 과 무관.
+    lake_symbol = str(getattr(config_mod, "LAKE_SYMBOL", None) or getattr(settings, "symbol", "BTCUSDT") or "BTCUSDT")
+    account_names = _account_names(settings)
 
     # ------------------------------------------------------------------ 공통 오류 처리
     @app.exception_handler(Exception)
@@ -338,10 +378,22 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
             raise _Reject(400, "INVALID_SIGNAL", "SCHEMA",
                           {"event_id": event_id, "fields": _schema_error_summary(e)}, authenticated=True)
 
-        # 5) 의미 검증
-        if sig.symbol != settings.symbol:
+        # 5) 의미 검증 — symbol 은 lake 표준(BTCUSDT), position_idx 는 대상 계정들의 허용 집합 합집합
+        if sig.symbol != lake_symbol:
             raise _Reject(400, "INVALID_SIGNAL", "SYMBOL_MISMATCH", {"event_id": sig.event_id}, authenticated=True)
-        if sig.position_idx not in settings.allowed_position_idx():
+        targets = _target_accounts_for(settings, sig)
+        if getattr(settings, "routing", "fanout") == "by_exchange" and not targets:
+            raise _Reject(400, "INVALID_SIGNAL", "NO_TARGET_ACCOUNT",
+                          {"event_id": sig.event_id, "exchange": sig.exchange}, authenticated=True)
+        allowed: set[int] = set()
+        for a in targets:
+            try:
+                allowed |= set(a.allowed_position_idx())
+            except Exception:  # noqa: BLE001
+                pass
+        if not allowed:
+            allowed = set(settings.allowed_position_idx())
+        if sig.position_idx not in allowed:
             raise _Reject(400, "INVALID_SIGNAL", "POSITION_MODE_MISMATCH", {"event_id": sig.event_id},
                           authenticated=True)
 
@@ -404,11 +456,12 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
         return await run_in_threadpool(_handle_signal, raw, headers)
 
     # ------------------------------------------------------------------ healthz
-    def _protection_missing_map(executor: Any) -> dict[str, list[str]]:
+    def _protection_missing_map(executor: Any, account: str | None = None) -> dict[str, list[str]]:
+        """모드별 보호주문 누락 lot (account=None 이면 모든 계정)."""
         out: dict[str, list[str]] = {}
         for m in MODES:
             try:
-                out[m] = list(executor.protection_missing(m)) if executor is not None else []
+                out[m] = list(executor.protection_missing(m, account)) if executor is not None else []
             except Exception as e:  # noqa: BLE001
                 log.warning("protection_missing(%s) failed: %s", m, type(e).__name__)
                 out[m] = []
@@ -417,7 +470,7 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
     @app.get("/healthz")
     def healthz():
         try:
-            inconsistent = _inconsistent_map(store)
+            inconsistent = _inconsistent_map(store, settings)
             missing = _protection_missing_map(_executor())
         except Exception as e:  # noqa: BLE001
             log.warning("healthz store error: %s", type(e).__name__)
@@ -444,17 +497,67 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
             return _json(401, {"error": "UNAUTHORIZED"})
         return None
 
-    def _exchange_positions(executor: Any, mode: str) -> Any:
-        """거래소 포지션 요약 (executor.exchanges[mode].positions()). 없거나 실패하면 None."""
+    def _exchange_of(executor: Any, mode: str, account: str) -> Any:
         exchanges = getattr(executor, "exchanges", None) or {}
-        ex = exchanges.get(mode) if isinstance(exchanges, dict) else None
+        by_mode = exchanges.get(mode) if isinstance(exchanges, dict) else None
+        if isinstance(by_mode, dict):
+            return by_mode.get(account)
+        return by_mode if account == account_names[0] else None   # 1단계 모양 호환
+
+    def _exchange_positions(executor: Any, mode: str, account: str) -> Any:
+        """거래소 포지션 요약 (executor.exchanges[mode][account].positions()). 없거나 실패하면 None."""
+        ex = _exchange_of(executor, mode, account) if executor is not None else None
         if ex is None:
             return None
         try:
             return {str(k): v for k, v in (ex.positions() or {}).items()}
         except Exception as e:  # noqa: BLE001
-            log.warning("state: positions(%s) failed: %s", mode, type(e).__name__)
+            log.warning("state: positions(%s/%s) failed: %s", mode, account, type(e).__name__)
             return {"error": type(e).__name__}
+
+    def _snapshot_positions(executor: Any, mode: str, account: str) -> Any:
+        if executor is None:
+            return None
+        try:
+            return executor.build_snapshot_positions(mode, account)
+        except Exception as e:  # noqa: BLE001
+            log.warning("state: build_snapshot_positions(%s/%s) failed: %s", mode, account, type(e).__name__)
+            return {"error": type(e).__name__}
+
+    def _account_section(executor: Any, acct: Any) -> dict:
+        """/state 의 계정별 섹션."""
+        name = acct.name
+        ok, reason = settings.live_execution_possible(acct)
+        sec: dict[str, Any] = {
+            "exchange": acct.exchange,
+            "display_name": acct.display_name,
+            "symbol": acct.symbol,
+            "enabled": bool(acct.enabled),
+            "report": bool(acct.report),
+            "position_mode": acct.position_mode,
+            "leverage": acct.leverage,
+            "margin_mode": acct.margin_mode,
+            "testnet": bool(acct.testnet),
+            "qty_multiplier": acct.qty_multiplier,
+            "has_real_keys": bool(acct.has_real_keys()),
+            "live_execution_possible": ok,
+            "live_block_reason": reason or None,
+            "report_url_configured": {m: bool((acct.report_url or {}).get(m)) for m in MODES},
+            "modes": {},
+        }
+        for m in MODES:
+            sec["modes"][m] = {
+                "exchange_ready": _exchange_of(executor, m, name) is not None,
+                "inconsistent": bool(store.is_inconsistent(m, name)),
+                "inconsistent_note": store.inconsistent_note(m, name),
+                "open_lots": store.open_lots(m, name),
+                "reports": store.recent_reports(m, name, STATE_REPORT_LIMIT),
+                "runs": store.recent_runs(m, name, STATE_SIGNAL_LIMIT),
+                "protection_missing": _protection_missing_map(executor, name)[m],
+                "snapshot_positions": _snapshot_positions(executor, m, name),
+                "exchange_positions": _exchange_positions(executor, m, name),
+            }
+        return sec
 
     @app.get("/state")
     def state(request: Request):
@@ -463,32 +566,37 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
             return denied
         executor = _executor()
         ok, reason = settings.live_execution_possible()
+        accounts = list(getattr(settings, "accounts", None) or [])
         out: dict[str, Any] = {
             "now_ms": now_ms(),
             "symbol": settings.symbol,
             "position_mode": settings.position_mode,
+            "routing": getattr(settings, "routing", "fanout"),
             "halted": _halted(settings),
             "live_execution_possible": ok,
             "live_block_reason": reason or None,
             "test_simulate_fills": bool(getattr(settings, "test_simulate_fills", False)),
-            "inconsistent": _inconsistent_map(store),
-            "inconsistent_note": {m: store.get_meta(f"inconsistent_note:{m}", "") for m in MODES},
+            "inconsistent": _inconsistent_map(store, settings),
+            "inconsistent_note": _inconsistent_notes(store, settings),
             "signals": store.recent_signals(STATE_SIGNAL_LIMIT),
-            "reports": {m: store.recent_reports(m, STATE_REPORT_LIMIT) for m in MODES},
+            "reports": {m: store.recent_reports(m, None, STATE_REPORT_LIMIT) for m in MODES},
             "open_lots": {m: store.open_lots(m) for m in MODES},
             "protection_missing": _protection_missing_map(executor),
             "ingress_rejections": stats.snapshot(),
-            "snapshot_positions": {},
-            "exchange_positions": {},
+            "snapshot_positions": {m: {} for m in MODES},
+            "exchange_positions": {m: {} for m in MODES},
+            "accounts": {},
         }
-        if executor is not None:
+        for acct in accounts:
+            try:
+                out["accounts"][acct.name] = _account_section(executor, acct)
+            except Exception as e:  # noqa: BLE001
+                log.warning("state: account section %s failed: %s", acct.name, type(e).__name__)
+                out["accounts"][acct.name] = {"error": type(e).__name__}
+                continue
             for m in MODES:
-                try:
-                    out["snapshot_positions"][m] = executor.build_snapshot_positions(m)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("state: build_snapshot_positions(%s) failed: %s", m, type(e).__name__)
-                    out["snapshot_positions"][m] = {"error": type(e).__name__}
-                out["exchange_positions"][m] = _exchange_positions(executor, m)
+                out["snapshot_positions"][m][acct.name] = out["accounts"][acct.name]["modes"][m]["snapshot_positions"]
+                out["exchange_positions"][m][acct.name] = out["accounts"][acct.name]["modes"][m]["exchange_positions"]
         return _json(200, out)
 
     @app.post("/admin/halt")
@@ -522,34 +630,49 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
         return _json(200, {"ok": True, "halted": False})
 
     @app.post("/admin/reconcile")
-    def admin_reconcile(request: Request, mode: str = "live"):
+    def admin_reconcile(request: Request, mode: str = "live", account: str | None = None):
+        """?mode=test|live[&account=name] — account 생략 시 그 모드에 거래소가 있는 모든 계정을 차례로 대사."""
         denied = _admin_gate(request)
         if denied is not None:
             return denied
         if mode not in MODES:
             return _json(400, {"error": "BAD_REQUEST", "code": "BAD_MODE"})
+        if account is not None and account not in account_names:
+            return _json(400, {"error": "BAD_REQUEST", "code": "BAD_ACCOUNT"})
         executor = _executor()
         if executor is None:
             return _json(503, {"error": "EXECUTOR_UNAVAILABLE"})
-        try:
-            consistent = bool(executor.reconcile(mode))
-        except Exception as e:  # noqa: BLE001
-            log.error("admin reconcile(%s) failed: %s", mode, type(e).__name__)
-            return _json(500, {"error": "INTERNAL", "code": "RECONCILE_FAILED"})
-        try:
-            positions = executor.build_snapshot_positions(mode)
-        except Exception as e:  # noqa: BLE001
-            log.warning("admin reconcile: build_snapshot_positions(%s) failed: %s", mode, type(e).__name__)
-            positions = None
-        log.warning("admin: reconcile(%s) -> consistent=%s", mode, consistent)
+        if account is None:
+            names = [n for n in account_names if _exchange_of(executor, mode, n) is not None]
+        else:
+            names = [account]
+        results: dict[str, Any] = {}
+        all_ok = bool(names)
+        for name in names:
+            try:
+                consistent = bool(executor.reconcile(mode, name))
+            except Exception as e:  # noqa: BLE001
+                log.error("admin reconcile(%s/%s) failed: %s", mode, name, type(e).__name__)
+                return _json(500, {"error": "INTERNAL", "code": "RECONCILE_FAILED", "account": name})
+            all_ok = all_ok and consistent
+            results[name] = {
+                "consistent": consistent,
+                "inconsistent": bool(store.is_inconsistent(mode, name)),
+                "inconsistent_note": store.inconsistent_note(mode, name),
+                "positions": _snapshot_positions(executor, mode, name),
+                "exchange_positions": _exchange_positions(executor, mode, name),
+            }
+            log.warning("admin: reconcile(%s/%s) -> consistent=%s", mode, name, consistent)
         return _json(200, {
-            "ok": consistent,
+            "ok": all_ok,
             "mode": mode,
-            "consistent": consistent,
-            "inconsistent": bool(store.is_inconsistent(mode)),
-            "inconsistent_note": store.get_meta(f"inconsistent_note:{mode}", ""),
-            "positions": positions,
-            "exchange_positions": _exchange_positions(executor, mode),
+            "account": account,
+            "consistent": all_ok,
+            "inconsistent": any(r["inconsistent"] for r in results.values()),
+            "inconsistent_note": "; ".join(f"{n}: {r['inconsistent_note']}" for n, r in results.items() if r["inconsistent_note"]),
+            "accounts": results,
+            "positions": {n: r["positions"] for n, r in results.items()},
+            "exchange_positions": {n: r["exchange_positions"] for n, r in results.items()},
         })
 
     return app

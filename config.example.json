@@ -1,5 +1,6 @@
 {
   "_comment": "비밀값은 여기 두지 않습니다. API 키·시크릿·회신 URL은 .env (.env.example 참고).",
+  "_comment_accounts": "v0.2: accounts[] 가 있으면 계정 목록으로 실행(라우팅 fanout|by_exchange). accounts 를 지우면 v0.1 과 같이 최상위 값 + BYBIT_* 로 bybit 계정 하나. 최상위 symbol/position_mode/leverage/margin_mode/testnet 은 accounts 가 있을 때 각 계정의 기본값이며 accounts[0] 값으로 다시 맞춰진다.",
 
   "symbol": "BTCUSDT",
   "category": "linear",
@@ -7,6 +8,49 @@
   "leverage": 5,
   "margin_mode": "isolated",
   "testnet": false,
+
+  "routing": "fanout",
+  "accounts": [
+    {
+      "name": "bybit",
+      "exchange": "bybit",
+      "enabled": true,
+      "symbol": "BTCUSDT",
+      "position_mode": "hedge",
+      "leverage": 5,
+      "margin_mode": "isolated",
+      "testnet": false,
+      "env_prefix": "BYBIT",
+      "qty_multiplier": 1.0,
+      "report": true
+    },
+    {
+      "name": "okx",
+      "exchange": "okx",
+      "enabled": false,
+      "symbol": "BTC-USDT-SWAP",
+      "position_mode": "hedge",
+      "leverage": 5,
+      "margin_mode": "isolated",
+      "testnet": false,
+      "env_prefix": "OKX",
+      "qty_multiplier": 1.0,
+      "report": false
+    },
+    {
+      "name": "toobit",
+      "exchange": "toobit",
+      "enabled": false,
+      "symbol": "BTC-SWAP-USDT",
+      "position_mode": "hedge",
+      "leverage": 5,
+      "margin_mode": "isolated",
+      "testnet": false,
+      "env_prefix": "TOOBIT",
+      "qty_multiplier": 1.0,
+      "report": false
+    }
+  ],
 
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "signal_path": "/lake/signal",

@@ -1,0 +1,685 @@
+{
+  "title": "lake(가명) strategt · 시그널 및 체결 회신 계약",
+  "version": 1,
+  "checked_at_kst": "2026-10-03",
+  "status": "LOCAL_RECORD_ONLY_RECEIVER_IMPLEMENTED_EXTERNAL_AGREEMENT_PENDING",
+  "boundaries": {
+    "outbound_signal_sender_implemented": false,
+    "external_sending_enabled": false,
+    "external_receiver_url_known": false,
+    "public_callback_url_deployed": false,
+    "exchange_account_verified": false,
+    "live_orders_supported_by_this_receiver": false
+  },
+  "incoming_execution_reports": {
+    "local_endpoint": "http://127.0.0.1:8766/api/execution-report",
+    "state_endpoint": "http://127.0.0.1:8766/api/execution-state",
+    "transport": "POST application/json; public HTTPS reverse proxy deployment pending",
+    "auth": {
+      "signature_header": "X-Signature",
+      "algorithm": "lowercase hex HMAC-SHA256(secret, exact raw request body bytes)",
+      "timestamp_header": "X-Timestamp",
+      "unit": "Unix milliseconds",
+      "header_equals_body_ts": true,
+      "max_clock_delta_ms": 60000,
+      "test_live_separate_secrets": true,
+      "dotenv_names": [
+        "LAKE_REPORT_SECRET_TEST",
+        "LAKE_REPORT_SECRET_LIVE"
+      ],
+      "min_secret_bytes": 32,
+      "secret_origin": ".env outside static document root only"
+    },
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "urn:lake:execution-report:1",
+      "title": "lake signed record-only execution report",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schema_version": {
+              "const": 1
+            },
+            "report_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+            },
+            "mode": {
+              "enum": [
+                "test",
+                "live"
+              ]
+            },
+            "sequence": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "ts": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "observed_at_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "exchange": {
+              "const": "Bybit"
+            },
+            "category": {
+              "const": "linear"
+            },
+            "symbol": {
+              "const": "BTCUSDT"
+            },
+            "kind": {
+              "const": "snapshot"
+            },
+            "complete": {
+              "const": true
+            },
+            "account_scope": {
+              "const": "lake_dedicated_BTCUSDT"
+            },
+            "positions": {
+              "type": "array",
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "position_id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+                  },
+                  "strategy": {
+                    "enum": [
+                      "basic",
+                      "overheat",
+                      "range"
+                    ]
+                  },
+                  "leg": {
+                    "enum": [
+                      "long",
+                      "short"
+                    ]
+                  },
+                  "position_idx": {
+                    "enum": [
+                      0,
+                      1,
+                      2
+                    ]
+                  },
+                  "qty": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  },
+                  "entry_price": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  },
+                  "mark_price": {
+                    "anyOf": [
+                      {
+                        "type": "number",
+                        "exclusiveMinimum": 0
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "stop_loss": {
+                    "anyOf": [
+                      {
+                        "type": "number",
+                        "exclusiveMinimum": 0
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "take_profit": {
+                    "anyOf": [
+                      {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {
+                          "type": "number",
+                          "exclusiveMinimum": 0
+                        }
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "updated_at_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "position_id",
+                  "strategy",
+                  "leg",
+                  "position_idx",
+                  "qty",
+                  "entry_price",
+                  "mark_price",
+                  "stop_loss",
+                  "take_profit",
+                  "updated_at_ms"
+                ],
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "position_idx": {
+                          "const": 1
+                        }
+                      }
+                    },
+                    "then": {
+                      "properties": {
+                        "leg": {
+                          "const": "long"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "position_idx": {
+                          "const": 2
+                        }
+                      }
+                    },
+                    "then": {
+                      "properties": {
+                        "leg": {
+                          "const": "short"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "required": [
+            "schema_version",
+            "report_id",
+            "mode",
+            "sequence",
+            "ts",
+            "observed_at_ms",
+            "exchange",
+            "category",
+            "symbol",
+            "kind",
+            "complete",
+            "account_scope",
+            "positions"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schema_version": {
+              "const": 1
+            },
+            "report_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+            },
+            "mode": {
+              "enum": [
+                "test",
+                "live"
+              ]
+            },
+            "sequence": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "ts": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "observed_at_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "exchange": {
+              "const": "Bybit"
+            },
+            "category": {
+              "const": "linear"
+            },
+            "symbol": {
+              "const": "BTCUSDT"
+            },
+            "kind": {
+              "const": "execution"
+            },
+            "execution": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "position_id": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+                },
+                "strategy": {
+                  "enum": [
+                    "basic",
+                    "overheat",
+                    "range"
+                  ]
+                },
+                "leg": {
+                  "enum": [
+                    "long",
+                    "short"
+                  ]
+                },
+                "position_idx": {
+                  "enum": [
+                    0,
+                    1,
+                    2
+                  ]
+                },
+                "event_id": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+                },
+                "action": {
+                  "enum": [
+                    "entry",
+                    "add",
+                    "partial_exit",
+                    "full_exit",
+                    "protection_update"
+                  ]
+                },
+                "status": {
+                  "enum": [
+                    "acknowledged",
+                    "submitted",
+                    "partially_filled",
+                    "filled",
+                    "rejected",
+                    "cancelled",
+                    "protection_updated",
+                    "error"
+                  ]
+                },
+                "qty": {
+                  "anyOf": [
+                    {
+                      "type": "number",
+                      "exclusiveMinimum": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "fill_price": {
+                  "anyOf": [
+                    {
+                      "type": "number",
+                      "exclusiveMinimum": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "order_id": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "fill_id": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "reason_code": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "position_id",
+                "strategy",
+                "leg",
+                "position_idx",
+                "event_id",
+                "action",
+                "status",
+                "qty",
+                "fill_price",
+                "order_id",
+                "fill_id",
+                "reason_code"
+              ],
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "position_idx": {
+                        "const": 1
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "leg": {
+                        "const": "long"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "position_idx": {
+                        "const": 2
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "leg": {
+                        "const": "short"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "status": {
+                        "enum": [
+                          "partially_filled",
+                          "filled"
+                        ]
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "qty": {
+                        "type": "number",
+                        "exclusiveMinimum": 0
+                      },
+                      "fill_price": {
+                        "type": "number",
+                        "exclusiveMinimum": 0
+                      },
+                      "fill_id": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "qty": {
+                        "type": "null"
+                      },
+                      "fill_price": {
+                        "type": "null"
+                      },
+                      "fill_id": {
+                        "type": "null"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "status": {
+                        "const": "protection_updated"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "action": {
+                        "const": "protection_update"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "required": [
+            "schema_version",
+            "report_id",
+            "mode",
+            "sequence",
+            "ts",
+            "observed_at_ms",
+            "exchange",
+            "category",
+            "symbol",
+            "kind",
+            "execution"
+          ]
+        }
+      ]
+    },
+    "semantic_validation": [
+      "No unknown fields, duplicate JSON keys, nonfinite numbers, compressed bodies, or request bodies larger than 65536 bytes.",
+      "observed_at_ms <= receive time + 5000 and <= ts + 5000; stored observed_at_ms must not decrease across the mode stream.",
+      "sequence starts at 1 and increases globally within each mode, independently from outgoing per-position event_sequence. Persist sequence across restarts.",
+      "Exact same report_id and raw bytes are idempotent; changed bytes conflict. All requests must pass the 60-second authentication window, including duplicates.",
+      "A new report_id must not reuse a fill_id. Several reports may share event_id for partial fills and statuses, but position/strategy/leg/action identity must remain unchanged.",
+      "A sequence gap marks live state inconsistent; the next consecutive complete snapshot reconciles the displayed current positions, not lost historical executions.",
+      "Only a complete dedicated-account BTCUSDT snapshot can assert flat. Include all attributed strategy lots; reconcile lot sums to actual exchange positions before asserting complete.",
+      "Do not mix position_idx 0 with 1/2 in a snapshot. One-way mode cannot have opposing long/short lots. Each position_id occurs once; updated_at_ms <= observed_at_ms.",
+      "The receiver accepts remote attestations and does not independently query Bybit. If account scope or strategy attribution cannot be proven, do not send complete:true.",
+      "Each fill report qty is incremental BTC fill quantity, not order size, not cumulative size, not percent. fill_price is actual incremental fill price.",
+      "Every non-fill report must use qty:null, fill_price:null, fill_id:null. reason_code is a sanitized symbolic code, never a free-text vendor exception.",
+      "Snapshot qty is remaining BTC size; entry_price is average actual entry; mark_price is actual venue mark or null. stop_loss:null means unconfirmed/unavailable; take_profit:null means unknown, [] means confirmed no TP orders.",
+      "No implicit zero defaults, performance/PnL inference, local position changes inferred from fills, or external writes."
+    ],
+    "get_state_semantics": {
+      "positions": "Current verified positions only; empty when not fresh.",
+      "last_known_positions": "Last complete snapshot positions retained separately, including when stale/inconsistent.",
+      "last_snapshot_observed_at_ms": "Observation time of last complete snapshot or null.",
+      "last_snapshot_received_at_ms": "Local receipt time of last complete snapshot or null.",
+      "positions_known": "True only when current state is fresh.",
+      "flat": "True/false only when fresh; otherwise null.",
+      "executions": "Latest 30 live reports for display only; freshness checks persist last position-changing sequence independently."
+    },
+    "freshness": {
+      "recommended_complete_snapshot_every_ms": 30000,
+      "stale_after_ms": 90000,
+      "freshness_clock": "observed_at_ms of latest full snapshot, not request receipt time",
+      "snapshot_after_each_fill_or_protection_update": true
+    },
+    "responses": {
+      "202": "Durably recorded only; no order submission.",
+      "200": "Exact duplicate durably existed; no repeated effect.",
+      "400": "Schema/semantic validation failed.",
+      "401": "Signature/timestamp failed.",
+      "403": "Origin/Host failed.",
+      "409": "Identity conflict, reversed order, or duplicate fill under a new report.",
+      "413": "Body too large.",
+      "415": "Unsupported media/encoding.",
+      "503": "Secret not configured or storage unavailable."
+    },
+    "retry": "No automatic retry configured. After timeout reconcile durable receipt; any agreed retry must reuse identical raw bytes/report_id/sequence inside the 60-second auth window. Do not change ts on the same report_id. Expired uncertain reports require reconciliation.",
+    "privacy": "No account identifiers accepted; order/fill identifiers become SHA256-derived pseudonyms before persistence/GET. position_id/event_id/report_id must be opaque, contain no account or personal data. No raw body or secret logs.",
+    "test_examples": {
+      "snapshot": {
+        "schema_version": 1,
+        "report_id": "report-demo-1",
+        "mode": "test",
+        "sequence": 1,
+        "ts": 1791024000000,
+        "observed_at_ms": 1791024000000,
+        "exchange": "Bybit",
+        "category": "linear",
+        "symbol": "BTCUSDT",
+        "kind": "snapshot",
+        "complete": true,
+        "account_scope": "lake_dedicated_BTCUSDT",
+        "positions": [
+          {
+            "position_id": "position-demo-1",
+            "strategy": "overheat",
+            "leg": "short",
+            "position_idx": 2,
+            "qty": 0.002,
+            "entry_price": 86000,
+            "mark_price": 85950,
+            "stop_loss": null,
+            "take_profit": null,
+            "updated_at_ms": 1791024000000
+          }
+        ]
+      },
+      "execution": {
+        "schema_version": 1,
+        "report_id": "report-demo-2",
+        "mode": "test",
+        "sequence": 2,
+        "ts": 1791024000000,
+        "observed_at_ms": 1791024000000,
+        "exchange": "Bybit",
+        "category": "linear",
+        "symbol": "BTCUSDT",
+        "kind": "execution",
+        "execution": {
+          "event_id": "event-demo-partial-1",
+          "position_id": "position-demo-1",
+          "strategy": "overheat",
+          "leg": "short",
+          "position_idx": 2,
+          "action": "partial_exit",
+          "status": "partially_filled",
+          "qty": 0.0005,
+          "fill_price": 85500,
+          "order_id": "order-example-only",
+          "fill_id": "fill-example-only",
+          "reason_code": null
+        }
+      },
+      "confirmed_flat": {
+        "schema_version": 1,
+        "report_id": "report-demo-3",
+        "mode": "test",
+        "sequence": 3,
+        "ts": 1791024000000,
+        "observed_at_ms": 1791024000000,
+        "exchange": "Bybit",
+        "category": "linear",
+        "symbol": "BTCUSDT",
+        "kind": "snapshot",
+        "complete": true,
+        "account_scope": "lake_dedicated_BTCUSDT",
+        "positions": []
+      }
+    }
+  },
+  "outgoing_signal_proposal": {
+    "status": "PROPOSED_NOT_AGREED_NOT_IMPLEMENTED",
+    "receiver_https_url": null,
+    "example": {
+      "schema_version": 1,
+      "strategy_name": "lake(가명) strategt",
+      "strategy": "overheat",
+      "mode": "test",
+      "event_id": "event-demo-1",
+      "event_sequence": 1,
+      "ts": 1791024000000,
+      "expires_at_ms": 1791024015000,
+      "exchange": "Bybit",
+      "category": "linear",
+      "symbol": "BTCUSDT",
+      "position_id": "position-demo-1",
+      "leg": "short",
+      "position_idx": 2,
+      "action": "entry",
+      "qty_btc": 0.002,
+      "expected_qty_btc_after": 0.002,
+      "reference_price": 86000,
+      "protection_revision": 1,
+      "stop_loss": null,
+      "take_profit": null
+    },
+    "actions": {
+      "entry": "Start a new strategy position.",
+      "add": "Add explicit incremental BTC quantity.",
+      "partial_exit": "Reduce explicit BTC quantity only; reduceOnly.",
+      "full_exit": "Close only the indicated strategy position/leg; require agreed attribution and reconciliation, never the whole symbol by default.",
+      "protection_update": "Update confirmed protection revision for indicated position; qty_btc is null."
+    },
+    "semantics": [
+      "event_id remains immutable for retries; event_sequence increases per position_id, independent of incoming sequence.",
+      "qty_btc is explicit positive incremental quantity except protection_update=null; no percentage sizing. expected_qty_btc_after is expected total remaining position size for reconciliation.",
+      "reference_price is signal context, never actual fill price. Missing SL/TP is null; risk policy must be agreed before order execution.",
+      "signal expiration 15 seconds in example is a proposal only. Receiver must reject expired/out-of-order/duplicate conflicting signals.",
+      "mode:test must only record and never trade. Endpoint/operator stop, pending cancellation, recovery and retries must be agreed before live sends.",
+      "Persist receipt before 2xx; acknowledge receipt separately from venue submission/fill. Past backtest events must never be emitted as live events."
+    ]
+  },
+  "legacy_source": {
+    "verified": "User-provided ZigZag v1.0 screenshots; previously six HTTP200 test/open/close receipts",
+    "not_proof_of_lake_live_connection": true,
+    "close_meaning": "Old close means full-symbol reduceOnly close; cannot represent partial exits."
+  },
+  "references": [
+    {
+      "title": "Bybit Get Position Info",
+      "url": "https://bybit-exchange.github.io/docs/v5/position",
+      "checked_at_kst": "2026-10-03"
+    },
+    {
+      "title": "Bybit Private Execution stream",
+      "url": "https://bybit-exchange.github.io/docs/v5/websocket/private/execution",
+      "checked_at_kst": "2026-10-03"
+    }
+  ]
+}

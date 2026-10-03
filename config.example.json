@@ -1,0 +1,41 @@
+{
+  "_comment": "비밀값은 여기 두지 않습니다. API 키·시크릿·회신 URL은 .env (.env.example 참고).",
+
+  "symbol": "BTCUSDT",
+  "category": "linear",
+  "position_mode": "hedge",
+  "leverage": 5,
+  "margin_mode": "isolated",
+  "testnet": false,
+
+  "listen": { "host": "127.0.0.1", "port": 8787 },
+  "signal_path": "/lake/signal",
+  "max_body_bytes": 65536,
+  "max_clock_skew_ms": 60000,
+
+  "live": { "enabled": false },
+  "test": { "simulate_fills": false },
+
+  "guards": {
+    "max_order_qty_btc": 0.05,
+    "max_leg_qty_btc": 0.2,
+    "max_entry_slippage_pct": 1.5,
+    "protection_trigger_by": "MarkPrice"
+  },
+
+  "report": {
+    "snapshot_interval_ms": 30000,
+    "http_timeout_s": 5,
+    "max_attempts": 3,
+    "attempt_window_ms": 50000
+  },
+
+  "exchange": {
+    "fill_poll_timeout_s": 10,
+    "fill_poll_interval_s": 0.5,
+    "reconcile_interval_ms": 30000
+  },
+
+  "state_dir": "state",
+  "log_file": "state/lake-executor.log"
+}

@@ -1,0 +1,120 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>lake(가명) strategt · 시그널 연동 설명서</title><style>
+:root{--ink:#162b35;--muted:#576b76;--line:#cbd7db;--accent:#176258;--tint:#edf5f2;--warn:#87621a}*{box-sizing:border-box}body{margin:0;background:#edf1f2;color:var(--ink);font:16px/1.8 system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif}main{max-width:1080px;margin:30px auto;padding:44px 52px;background:white;border:1px solid var(--line)}h1{font-size:34px;line-height:1.3;letter-spacing:-1px;margin:8px 0 18px}h2{font-size:23px;margin:42px 0 12px;line-height:1.4}h3{font-size:18px;margin:24px 0 10px}p{margin:10px 0}.eyebrow{font-size:12px;letter-spacing:2px;font-weight:750;color:var(--accent)}.lead{font-size:19px}.muted,small{color:var(--muted)}.status,.note{background:var(--tint);border-left:4px solid var(--accent);padding:16px 20px;margin:20px 0}.warning{border-color:var(--warn);background:#faf5e9}.steps{display:grid;grid-template-columns:1fr 1fr;gap:12px}.step{border:1px solid var(--line);padding:16px 20px}.step strong{display:block;margin-bottom:8px}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border-bottom:1px solid var(--line);padding:10px 12px;text-align:left;vertical-align:top}th{background:#f0f4f5}td:first-child{min-width:130px}code{font-family:ui-monospace,Consolas,monospace;font-size:.9em;overflow-wrap:anywhere}pre{background:#102832;color:#e5f1ee;padding:20px;overflow:auto;line-height:1.55;font-size:13px;border-radius:4px}pre code{white-space:pre}ol,ul{padding-left:24px}li{margin:7px 0}a{color:#146454;text-underline-offset:3px}.request{border:1px solid var(--line);padding:20px}.tag{font-size:12px;padding:3px 8px;background:#e7efed;border-radius:3px;white-space:nowrap}.toc{display:flex;gap:8px 18px;flex-wrap:wrap;font-size:14px;margin:22px 0}.toc a{text-decoration:none}footer{border-top:1px solid var(--line);padding-top:18px;margin-top:34px;font-size:13px;color:var(--muted)}details{border-top:1px solid var(--line);padding:12px 0}summary{cursor:pointer;font-weight:650}@media(max-width:650px){body{font-size:15px}main{margin:0;padding:28px 18px;border:0}h1{font-size:27px}h2{font-size:21px}.lead{font-size:17px}.steps{grid-template-columns:1fr}.status,.note,.step,.request{padding:14px}pre{padding:14px;font-size:12px}td,th{padding:8px}td:first-child{min-width:105px}}@media print{body{background:white}main{max-width:none;margin:0;border:0;padding:0}.toc{display:none}h2,h3{break-after:avoid}.status,.step{break-inside:avoid}pre{white-space:pre-wrap;background:#f4f4f4;color:#111}details{display:block}}
+</style></head><body><main><header><div class="eyebrow">LAKE · INTEGRATION GUIDE · V1</div><h1>시그널을 받고,<br>실제 체결을 돌려보내는 방법</h1><p class="lead">lake(가명) strategt와 상대 매매 서버를 연결하기 위한 개발자 설명서입니다. <strong>신호 전달</strong>과 <strong>체결·포지션 회신</strong>을 따로 연결해야 대시보드에서 실제 보유 현황을 볼 수 있습니다.</p></header>
+<div class="status"><strong>현재: 로컬 기록 전용 회신 수신기 구현 · 실제 연동 미완료</strong><br>상대 수신 주소와 공개 회신 주소는 미정입니다. 실제 시크릿·계정 연결은 설정하지 않았으며, 이 수신기에는 주문·신호 발송·거래소 조회 기능이 없습니다. 발신 신호 규격은 협의안입니다.</div>
+<nav class="toc"><a href="#flow">연결 흐름</a><a href="#prepare">상대 준비</a><a href="#signal">받는 신호</a><a href="#callback">돌려보낼 회신</a><a href="#status">표시 기준</a><a href="#test">테스트 순서</a><a href="#request">전달 요청문</a></nav>
+<h2 id="flow">1. 연결 흐름</h2><div class="steps"><div class="step"><strong>① 우리 → 상대: 매매 신호</strong>우리 전략이 신규 진입·추가 진입·부분 청산·전량 종료·보호가격 변경을 상대의 HTTPS 주소로 전달합니다. <span class="tag">발신기 미구현 · 규격 협의</span></div><div class="step"><strong>② 상대 → 우리: 실제 결과</strong>상대가 신호 접수, 주문 제출, 체결·거부·취소와 전체 포지션 현황을 회신합니다. 대시보드는 이 회신을 표시합니다. <span class="tag">로컬 수신기 구현</span></div></div>
+<p><strong>차트의 백테스트 거래와 상대 계정의 실제 체결은 별개입니다.</strong> 과거 차트 표시는 발송 대상이 아니며, HTTP 2xx 접수도 실제 주문이나 체결을 뜻하지 않습니다.</p>
+<h2 id="prepare">2. 상대 개발자가 먼저 준비할 것</h2><ol><li><strong>주문을 실행하지 않는 HTTPS 테스트 수신 주소</strong>를 알려주세요. lake 전용 경로인지, 기존 ZigZag 경로를 재사용할지도 확정합니다.</li><li><strong>두 방향의 인증 키를 안전하게 교환</strong>할 방법을 정합니다. 방향별 키를 분리하고 회신용 TEST/LIVE 키도 서로 다르게 만듭니다. 실값은 메신저 본문·화면·소스·로그에 넣지 않고 각 서버의 비공개 <code>.env</code>에 보관합니다.</li><li><strong>분할 체결·추가 진입·부분 청산·롱/숏 헤지·보호가격 변경</strong> 지원과 전략별 수량 귀속 방법을 확인합니다. Bybit가 같은 방향 포지션을 합산해도 상대의 원장에서 기본·횡보·과열 몫을 구분해야 합니다.</li><li><strong>실제 체결 회신 기능</strong>을 구현합니다. Bybit 실제 체결 자료를 근거로 결과를 보내고, 30초마다 완전한 포지션 스냅샷을 보냅니다. 주문 체결 또는 보호가격 변경 직후에도 전체 스냅샷을 갱신합니다.</li><li><strong>연결 중단·오류 시 조치</strong>를 정합니다. 신규 처리 중지, 미처리 작업 확인·취소, 기존 보호주문 유지, 대사 후 수동 재개 절차를 합의합니다. 실제 발송·실거래는 별도 승인 전까지 활성화하지 않습니다.</li></ol>
+<div class="note warning">기존 대화의 마지막 “연동 완료·6건 HTTP 200”은 <strong>ZigZag</strong>의 당시 기록입니다. 그 규격의 <code>close</code>는 <strong>종목 전량 청산</strong>입니다. lake의 부분 익절을 기존 <code>close</code>로 보내면 안 됩니다.</div>
+<h2 id="signal">3. 상대가 받을 매매 신호 <span class="tag">협의안 · 발신 코드 없음</span></h2><p>대상은 <code>Bybit / linear / BTCUSDT</code>, 수량은 <strong>BTC</strong>, 가격은 <strong>USDT</strong>입니다. 전략 코드는 <code>basic</code>(기본), <code>overheat</code>(과열), <code>range</code>(횡보)로 구분합니다.</p>
+<div class="scroll"><table><thead><tr><th>action</th><th>의미와 상대 처리</th></tr></thead><tbody><tr><td>entry</td><td>지정 전략·포지션·레그 신규 진입.</td></tr><tr><td>add</td><td>지정 포지션에 <code>qty_btc</code>만큼 추가. 반복 이벤트도 고유 ID로 구분.</td></tr><tr><td>partial_exit</td><td>지정 포지션 몫에서 명시 BTC 수량만 감소. reduceOnly, 전량 청산으로 변환 금지.</td></tr><tr><td>full_exit</td><td>지정 전략 포지션·레그의 잔량 종료. 다른 전략이나 반대 레그까지 종목 전량 청산하지 않음.</td></tr><tr><td>protection_update</td><td>보호가격 변경, <code>protection_revision</code> 증가. <code>qty_btc:null</code>. 실제 적용 결과 회신.</td></tr></tbody></table></div>
+<p><code>event_id</code>는 재전송에도 불변이며, <code>event_sequence</code>는 <strong>position_id별</strong> 증가합니다. 신호의 <code>reference_price</code>는 참고 가격이고 실제 체결가는 아닙니다. <code>expected_qty_btc_after</code>는 처리 후 기대 잔량입니다. 퍼센트 수량 해석은 사용하지 않습니다.</p>
+<p>상대는 신호의 유효시간·중복·순서·수량을 검증하고 영속 접수 후 5초 안에 2xx를 반환합니다. 예제의 15초 유효시간, 재시도·손절 미확인 시 정책 등은 최종 합의 대상입니다. <code>mode:test</code>는 기록만 하며 주문을 실행하지 않습니다.</p>
+<details><summary>매매 신호 JSON 예시 보기 — 테스트 합성값</summary><pre><code>{
+  &quot;schema_version&quot;: 1,
+  &quot;strategy_name&quot;: &quot;lake(가명) strategt&quot;,
+  &quot;strategy&quot;: &quot;overheat&quot;,
+  &quot;mode&quot;: &quot;test&quot;,
+  &quot;event_id&quot;: &quot;event-demo-1&quot;,
+  &quot;event_sequence&quot;: 1,
+  &quot;ts&quot;: 1791024000000,
+  &quot;expires_at_ms&quot;: 1791024015000,
+  &quot;exchange&quot;: &quot;Bybit&quot;,
+  &quot;category&quot;: &quot;linear&quot;,
+  &quot;symbol&quot;: &quot;BTCUSDT&quot;,
+  &quot;position_id&quot;: &quot;position-demo-1&quot;,
+  &quot;leg&quot;: &quot;short&quot;,
+  &quot;position_idx&quot;: 2,
+  &quot;action&quot;: &quot;entry&quot;,
+  &quot;qty_btc&quot;: 0.002,
+  &quot;expected_qty_btc_after&quot;: 0.002,
+  &quot;reference_price&quot;: 86000,
+  &quot;protection_revision&quot;: 1,
+  &quot;stop_loss&quot;: null,
+  &quot;take_profit&quot;: null
+}</code></pre></details>
+<h2 id="callback">4. 상대가 돌려보낼 체결 회신 <span class="tag">구현된 수신 규격</span></h2><p>로컬 수신 주소: <code>POST http://127.0.0.1:8766/api/execution-report</code><br>대시보드 조회: <code>GET http://127.0.0.1:8766/api/execution-state</code></p><p><strong>127.0.0.1은 우리 컴퓨터 내부 주소입니다.</strong> 상대 서버가 접근할 공인 HTTPS 회신 주소는 별도로 배포·합의해야 합니다. 현재 외부에 공개되지 않았습니다. 공개 시 POST 회신 경로만 노출하고, 상태 조회는 로컬에서만 사용합니다.</p>
+<h3>인증·저장</h3><div class="scroll"><table><tbody><tr><th>헤더</th><th>필수 값</th></tr><tr><td>Content-Type</td><td><code>application/json</code>. 압축 본문 불허, 본문 최대 65,536바이트.</td></tr><tr><td>X-Signature</td><td><code>hex(HMAC-SHA256(secret, raw_body))</code>, 소문자 16진수 64자리. 받은 원본 바이트로 검증하며 JSON 재직렬화 금지.</td></tr><tr><td>X-Timestamp</td><td>Unix 밀리초. 본문 <code>ts</code>와 정확히 일치, 수신 시각에서 ±60초 이내.</td></tr><tr><td>회신 키</td><td><code>LAKE_REPORT_SECRET_TEST</code>, <code>LAKE_REPORT_SECRET_LIVE</code>. 서로 다른 최소 32바이트 값. 정적 웹 폴더 밖의 <code>.env</code>에서만 읽으며 운영체제 환경변수·명령 인자로 받지 않음.</td></tr><tr><td>운영 상태</td><td>LIVE 키가 없으면 화면은 미연동. 해당 mode 키가 없으면 POST 503. TEST 보고는 LIVE 포지션·체결 화면에서 제외.</td></tr></tbody></table></div>
+<p>보고서는 비공개 SQLite에 영속 저장합니다. 계정 식별자 필드는 받지 않습니다. 실제 주문·체결 ID는 해시 기반 가명으로 바꾼 뒤 저장·표시하며 원본 본문·키는 로그에 남기지 않습니다. <code>position_id/event_id/report_id</code>는 계정·개인정보를 포함하지 않는 불투명 ID로 정하세요.</p>
+<h3>공통 필드</h3><div class="scroll"><table><thead><tr><th>필드</th><th>의미</th></tr></thead><tbody><tr><td>schema_version</td><td>정수 <code>1</code>. 정의되지 않은 필드와 JSON 중복 키는 거부.</td></tr><tr><td>report_id</td><td>회신 건별 고유 ID. 같은 ID는 같은 원본 본문만 허용.</td></tr><tr><td>mode</td><td><code>test</code> 또는 <code>live</code>. 키·순서·중복 저장도 분리.</td></tr><tr><td>sequence</td><td>mode별 회신 전체 스트림에서 1부터 증가. 재시작 뒤에도 유지. 신호의 position별 event_sequence 및 Bybit seq와 별개.</td></tr><tr><td>ts</td><td>이 회신 본문의 생성·서명 시각, Unix ms.</td></tr><tr><td>observed_at_ms</td><td>실제 확인한 데이터의 시각, Unix ms. 접수 시각·ts보다 5초 이상 미래 금지. 같은 mode 내 시간 역전 거부.</td></tr><tr><td>exchange/category/symbol</td><td><code>Bybit / linear / BTCUSDT</code> 고정.</td></tr><tr><td>kind</td><td><code>execution</code>: 개별 처리·체결 결과. <code>snapshot</code>: 전체 실제 포지션 확인.</td></tr></tbody></table></div>
+<h3>A. 개별 처리·체결 결과 — kind: execution</h3><p><code>execution</code>에 신호 <code>event_id</code>, 포지션 <code>position_id</code>, 전략, 방향, <code>position_idx</code>, 동작, 처리 상태를 넣습니다. 같은 event_id의 후속 보고는 같은 포지션·전략·방향·동작을 유지해야 합니다.</p><p>상태: <code>acknowledged</code>(접수), <code>submitted</code>(주문 제출), <code>partially_filled</code>(부분 체결), <code>filled</code>(체결), <code>rejected</code>(거부), <code>cancelled</code>(취소), <code>protection_updated</code>(보호가격 반영), <code>error</code>(오류).</p><p><strong>체결 보고의 qty는 그 한 번에 새로 체결된 BTC 수량</strong>입니다. 누적 수량·원주문 수량이 아닙니다. <code>fill_price</code>는 그 체결의 실제 가격이고, <code>fill_id</code>가 필수입니다. 여러 부분 체결은 서로 다른 report_id/sequence/fill_id로 보냅니다. 같은 fill_id를 새 report_id로 중복 보고하면 409로 거부됩니다.</p><p>체결 외 상태에서는 <code>qty, fill_price, fill_id</code>를 모두 <code>null</code>로 보냅니다. 보호가격 반영은 <code>action:protection_update</code>로 보내고 바로 최신 스냅샷을 뒤따르게 합니다. <code>reason_code</code>는 정리된 코드만 사용하며 계정정보가 포함될 수 있는 거래소 오류 원문은 넣지 않습니다.</p>
+<details open><summary>체결 회신 JSON 예시 — 주문하지 않는 합성 테스트</summary><pre><code>{
+  &quot;schema_version&quot;: 1,
+  &quot;report_id&quot;: &quot;report-demo-2&quot;,
+  &quot;mode&quot;: &quot;test&quot;,
+  &quot;sequence&quot;: 2,
+  &quot;ts&quot;: 1791024000000,
+  &quot;observed_at_ms&quot;: 1791024000000,
+  &quot;exchange&quot;: &quot;Bybit&quot;,
+  &quot;category&quot;: &quot;linear&quot;,
+  &quot;symbol&quot;: &quot;BTCUSDT&quot;,
+  &quot;kind&quot;: &quot;execution&quot;,
+  &quot;execution&quot;: {
+    &quot;event_id&quot;: &quot;event-demo-partial-1&quot;,
+    &quot;position_id&quot;: &quot;position-demo-1&quot;,
+    &quot;strategy&quot;: &quot;overheat&quot;,
+    &quot;leg&quot;: &quot;short&quot;,
+    &quot;position_idx&quot;: 2,
+    &quot;action&quot;: &quot;partial_exit&quot;,
+    &quot;status&quot;: &quot;partially_filled&quot;,
+    &quot;qty&quot;: 0.0005,
+    &quot;fill_price&quot;: 85500,
+    &quot;order_id&quot;: &quot;order-example-only&quot;,
+    &quot;fill_id&quot;: &quot;fill-example-only&quot;,
+    &quot;reason_code&quot;: null
+  }
+}</code></pre></details>
+<h3>B. 실제 전체 포지션 — kind: snapshot</h3><p><code>complete:true</code>, <code>account_scope:lake_dedicated_BTCUSDT</code>를 명시합니다. 이 범위는 <strong>lake 전용 계정의 BTCUSDT 전체 포지션</strong>이며 다른 계정·종목까지 비어 있다는 뜻은 아닙니다. 기본·과열·횡보 몫을 모두 포함하고 전략별 합계와 거래소 실제 수량을 대사한 뒤 보내야 합니다.</p><p>타 전략과 공유하는 계정이거나 귀속이 불확실하면 <code>complete:true</code>를 보내지 마세요. 현재 수신기는 그러한 불완전 스냅샷을 거부하고 미확인 상태를 유지합니다. 수신기는 상대의 확인 자료를 기록하며 Bybit에 직접 접속해 진위를 재검증하지는 않습니다.</p><p>포지션별 <code>qty</code>는 잔여 BTC 수량, <code>entry_price</code>는 실제 평균 진입가입니다. <code>mark_price</code>는 Bybit 마크가격 또는 null, <code>stop_loss</code>는 확인된 손절가 또는 null입니다. <code>take_profit:null</code>은 미확인, <code>[]</code>는 익절 주문이 없다고 확인됨, 가격 배열은 현재 확인된 익절 가격들입니다. 누락 값을 0으로 대신하지 않습니다. 각 <code>updated_at_ms</code>는 스냅샷 관측 시각 이하여야 합니다.</p><p>Bybit의 <code>positionIdx=0</code>은 단방향, <code>1</code>은 헤지 롱, <code>2</code>는 헤지 숏입니다. 한 스냅샷에서 단방향과 헤지 모드를 섞지 않습니다. 단방향에서 서로 반대 방향 몫을 동시에 보고할 수도 없습니다. 같은 position_id는 한 번만 포함합니다.</p>
+<details><summary>보유 포지션 JSON 예시</summary><pre><code>{
+  &quot;schema_version&quot;: 1,
+  &quot;report_id&quot;: &quot;report-demo-1&quot;,
+  &quot;mode&quot;: &quot;test&quot;,
+  &quot;sequence&quot;: 1,
+  &quot;ts&quot;: 1791024000000,
+  &quot;observed_at_ms&quot;: 1791024000000,
+  &quot;exchange&quot;: &quot;Bybit&quot;,
+  &quot;category&quot;: &quot;linear&quot;,
+  &quot;symbol&quot;: &quot;BTCUSDT&quot;,
+  &quot;kind&quot;: &quot;snapshot&quot;,
+  &quot;complete&quot;: true,
+  &quot;account_scope&quot;: &quot;lake_dedicated_BTCUSDT&quot;,
+  &quot;positions&quot;: [
+    {
+      &quot;position_id&quot;: &quot;position-demo-1&quot;,
+      &quot;strategy&quot;: &quot;overheat&quot;,
+      &quot;leg&quot;: &quot;short&quot;,
+      &quot;position_idx&quot;: 2,
+      &quot;qty&quot;: 0.002,
+      &quot;entry_price&quot;: 86000,
+      &quot;mark_price&quot;: 85950,
+      &quot;stop_loss&quot;: null,
+      &quot;take_profit&quot;: null,
+      &quot;updated_at_ms&quot;: 1791024000000
+    }
+  ]
+}</code></pre></details><details><summary>완전 청산 확인 예시 — positions: []</summary><pre><code>{
+  &quot;schema_version&quot;: 1,
+  &quot;report_id&quot;: &quot;report-demo-3&quot;,
+  &quot;mode&quot;: &quot;test&quot;,
+  &quot;sequence&quot;: 3,
+  &quot;ts&quot;: 1791024000000,
+  &quot;observed_at_ms&quot;: 1791024000000,
+  &quot;exchange&quot;: &quot;Bybit&quot;,
+  &quot;category&quot;: &quot;linear&quot;,
+  &quot;symbol&quot;: &quot;BTCUSDT&quot;,
+  &quot;kind&quot;: &quot;snapshot&quot;,
+  &quot;complete&quot;: true,
+  &quot;account_scope&quot;: &quot;lake_dedicated_BTCUSDT&quot;,
+  &quot;positions&quot;: []
+}</code></pre></details>
+<p class="muted">예시의 시각·가격·수량·ID는 합성값입니다. 그대로 전송하면 만료된 시각으로 거부됩니다. 테스트를 실행할 때 현재 Unix 밀리초로 바꾸고 비공개 TEST 키로 서명해야 합니다. 이 문서에 실제 키는 없습니다.</p>
+<h2 id="status">5. 대시보드가 “실제 포지션”을 판단하는 기준</h2><div class="scroll"><table><thead><tr><th>상태</th><th>표시 의미</th></tr></thead><tbody><tr><td>미연동 / 확인 대기</td><td>LIVE 키 또는 완전한 스냅샷이 없음. “포지션 없음”이라고 추정하지 않음.</td></tr><tr><td>최신 확인</td><td>완전한 LIVE 스냅샷의 관측 시각이 90초 이내이고 순서 누락·후속 체결 미대사가 없음.</td></tr><tr><td>보유 없음</td><td>위 조건을 만족하면서 전체 positions가 빈 배열일 때만 확인됨.</td></tr><tr><td>갱신 지연</td><td>마지막 전체 스냅샷 관측이 90초 초과. 과거 잔량을 최신으로 표시하지 않음.</td></tr><tr><td>불일치</td><td>sequence 누락 또는 체결·보호가격 변경 뒤 전체 스냅샷 미수신. 회신 누락 뒤 다음 연속 번호의 완전 스냅샷으로 현재 잔량을 다시 확인. 빠진 과거 체결 기록은 별도 대사 필요.</td></tr></tbody></table></div>
+<p>조회 응답의 <code>positions</code>는 현재 정합성이 확인될 때만 반환합니다. 지연·불일치 상태의 지난 자료는 <code>last_known_positions</code>와 <code>last_snapshot_observed_at_ms / last_snapshot_received_at_ms</code>에 별도 보관합니다. <code>positions_known</code>은 현재 확인 여부이고 <code>flat:null</code>은 알 수 없다는 뜻입니다. 표시용 최근 체결 30건과 별도로 마지막 잔량·보호가격 변경 순서를 영속 추적하므로 오래된 미대사 체결이 목록에서 빠져도 정상으로 바뀌지 않습니다.</p><p>체결 한 건만으로 포지션 잔량을 임의 계산하지 않습니다. 잔량이 0이라고 보이려면 실제 전체 스냅샷이 와야 합니다. 체결·손절·익절 확인과 백테스트 계산은 분리되며 비용 반영 수익률을 이 수신기에서 계산하지 않습니다.</p>
+<h3>중복·순서·실패 처리</h3><ul><li>같은 report_id + 같은 원본 본문은 <code>200 duplicate:true</code>. 최초 영속 접수는 <code>202</code>. 둘 다 기록 접수일 뿐 주문 실행을 뜻하지 않습니다.</li><li>같은 ID의 다른 본문, 이미 처리한 sequence 또는 관측 시각 역전, 새 report_id로 보낸 중복 fill_id는 <code>409</code>. 자동 우회·번호 덮어쓰기를 하지 않고 원장을 대조합니다.</li><li><code>400</code> 형식·의미 오류, <code>401</code> 서명·시간 오류, <code>403</code> Origin/Host 오류, <code>413</code> 본문 크기 초과, <code>415</code> 형식·압축 오류, <code>503</code> 키 미설정·저장 실패입니다.</li><li><strong>자동 재시도는 설정하지 않았습니다.</strong> 재시도 정책을 합의할 경우 60초 인증 허용 시간 안에 같은 원본 본문·ID·sequence를 유지해야 합니다. 같은 ID의 ts만 바꾸면 충돌합니다. 시간 초과 후 접수 여부가 모호하거나 60초가 지났으면 먼저 대사합니다.</li><li>예전 ZigZag의 “0.5초 후 1회 재시도”는 현재 lake에 자동 승계되지 않습니다.</li></ul>
+<h2 id="test">6. 기록 전용 검증 순서</h2><ol><li>양쪽을 TEST 모드로 준비하고 주문 실행을 차단합니다. 공개 주소·인증·보고 범위를 확정합니다.</li><li>정상 서명·잘못된 서명·만료 시각·본문 변경을 보내 통과와 거부가 모두 동작하는지 확인합니다.</li><li>빈 전체 스냅샷 → 신규 진입 결과 → 보유 스냅샷 → 추가·분할 체결 → 부분 청산 → 보호가격 변경 → 전량 종료 결과 → 빈 전체 스냅샷을 기록합니다. 매 단계 보고서와 대시보드를 대조합니다.</li><li>재전송, 같은 ID 다른 내용, 중복 fill_id, 순서 역전, 번호 누락, 90초 이상 지연, 헤지 두 레그와 전략별 합계 불일치를 시험합니다.</li><li>TEST 보고가 실제 계정 화면에 들어오지 않는지, 재시작 뒤 중복 방지가 유지되는지 확인합니다.</li><li>운영 전 LIVE 키·미래 시작 시각·중지/복구·실패/재시도 정책·수량/리스크·공개 HTTPS 보호 설정을 검토하고 실제 발송 승인 후 연결합니다. 과거 백테스트 거래를 보내지 않습니다.</li></ol>
+<h3>우리 로컬 수신기 실행</h3><p>기록 파일과 <code>.env</code>는 정적 웹 서버가 제공하는 <code>Documents/Codex</code> 전체 밖에 둡니다. 개발 확인용 예시는 아래와 같습니다. <code>/tmp</code> 데이터는 재부팅 시 사라질 수 있으므로 운영 시 승인된 영속 비공개 디렉터리를 사용해야 합니다.</p><pre><code>python3 execution_receiver.py   --state-dir /tmp/lake_execution_receiver   --env-file /tmp/lake_execution_receiver/.env</code></pre><p>키 파일이 없으면 미연동 상태로만 실행됩니다. 바인딩은 <code>127.0.0.1:8766</code>, 브라우저 허용 Origin은 <code>http://127.0.0.1:8765</code> 하나입니다. 외부 HTTPS 배포, 상대 주소 접촉, 실제 키 설정은 이 작업에서 수행하지 않았습니다.</p>
+<h2 id="request">7. 상대 개발자에게 전달할 요청문</h2><div class="request">lake(가명) strategt의 시그널 수신과 실제 체결 회신을 연결하려고 합니다. 우선 주문 없는 기록 전용 테스트로 진행해주세요. 테스트용 HTTPS 신호 수신 주소와 안전한 키 교환 방법, 추가 진입·부분 청산·롱/숏 헤지·보호가격 변경 지원 여부를 알려주세요. 첨부 규격의 신호 접수·체결 결과를 구분해 회신하고, 30초마다 lake 전용 BTCUSDT 전체 포지션 스냅샷을 보내는 방식으로 맞추고 싶습니다. 기존 ZigZag close는 전량 청산이라 부분 익절에 재사용하지 않습니다. 신호 발신 규격과 공개 회신 주소는 함께 확정한 뒤 TEST 검증하고 실제 발송 여부를 별도 결정하겠습니다.</div>
+<p><a href="lake_execution_contract.json">기계 판독용 JSON 계약·스키마·테스트 예제 내려받기</a> · <a href="lake_웹훅_수신안내.html">기존 대화의 웹훅 규격 근거</a></p>
+<footer>작성·공식 사양 확인: 2026-10-03 KST. Bybit <a href="https://bybit-exchange.github.io/docs/v5/position">포지션 조회 공식 문서</a>, <a href="https://bybit-exchange.github.io/docs/v5/websocket/private/execution">실제 체결 스트림 공식 문서</a>를 참고했습니다. 기존 대화의 시크릿·주소·개인 정보는 기재하지 않았습니다. 여기의 실체결 회신 계약은 로컬 구현 기준이며 상대 개발자와의 합의·공개 배포·계정 연결은 남아 있습니다.</footer>
+</main></body></html>

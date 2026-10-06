@@ -101,7 +101,8 @@ sudo chown caddy:caddy /var/log/caddy 2>/dev/null || true
 sudo cp "$APP_DIR/deploy/Caddyfile" /etc/caddy/Caddyfile
 sudo chmod 644 /etc/caddy/Caddyfile
 echo ">> validating Caddyfile"
-PUBLIC_HOST="$PUBLIC_HOST" ADMIN_ALLOW_CIDR="$ADMIN_ALLOW_CIDR" UI_ALLOW_CIDR="$UI_ALLOW_CIDR" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+# root 로 검증: 일반 유저로는 caddy 소유의 /var/log/caddy/access.log 를 못 열어 validate 가 실패한다
+sudo env PUBLIC_HOST="$PUBLIC_HOST" ADMIN_ALLOW_CIDR="$ADMIN_ALLOW_CIDR" UI_ALLOW_CIDR="$UI_ALLOW_CIDR" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
 sudo cp "$APP_DIR/deploy/lake-executor.service" /etc/systemd/system/lake-executor.service
 sudo chmod 644 /etc/systemd/system/lake-executor.service

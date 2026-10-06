@@ -34,6 +34,7 @@ lake ──POST /lake/signal (X-Signature / X-Timestamp)──▶ receiver.py �
 | 파일 | 역할 |
 |---|---|
 | `lake_executor/receiver.py` | FastAPI 수신기: `POST /lake/signal`, `GET /healthz`, 관리 엔드포인트(`/state`, `/admin/*`) |
+| `lake_executor/web.py` | 운영 대시보드 `/ui`: ADMIN_TOKEN 로그인·세션 쿠키·CSRF, 신호/주문/회신/접수 기록 조회, `.env`·`config.json` 편집(마스킹, 재시작으로만 적용), HALT/대사/재시작 |
 | `lake_executor/auth.py` | HMAC-SHA256 서명 검증/생성 (원본 바이트 그대로, 재직렬화 금지) |
 | `lake_executor/schemas.py` | 신호 스키마(pydantic, 미정의 필드 거부; `exchange` ∈ Bybit/OKX/Toobit), 상태·reason_code 열거형 |
 | `lake_executor/store.py` | SQLite 원장(schema v2): signals / signal_runs / lots / orders / fills / reports / ingress_log / meta — lots·orders·fills·reports 는 계정 단위. v0.1 DB 는 열 때 자동 마이그레이션(account='bybit') |
@@ -177,6 +178,30 @@ AWS EC2(서울) + Elastic IP + Caddy(자동 HTTPS 443) → `127.0.0.1:8787` lake
 절차·명령은 **`deploy/README.md`** 참고 (`provision.py` → `push.py` → `.env`/`config.json` 작성 → `finalize.py`).
 모든 거래소 API 키는 Elastic IP 로 IP 제한하므로 로컬에서 `check` 가 거래소 단계에서 실패하는 것이 정상이다.
 계정 추가 절차(키 권한, OKX passphrase·데모, Toobit 양방향 포지션)는 `docs/RUNBOOK.md` §6.
+
+## 운영 대시보드 (/ui)
+
+서버에 올린 뒤 브라우저로 **`https://<PUBLIC_HOST>/ui`** 를 열면 SSH 나 `.env` 편집 없이 운영할 수 있다. 로그인은 `.env` 의 `ADMIN_TOKEN`
+(관리 엔드포인트와 같은 값, 32바이트 이상) 하나뿐이고, `ADMIN_TOKEN` 이 없으면 `/ui` 전체가 404 다(`/admin/*` 와 같은 정책).
+신호는 여전히 **웹훅(`POST /lake/signal`) 으로만** 들어온다 — 대시보드는 신호를 만들거나 재생하지 않고, 주문을 직접 내지도 않는다.
+
+| 페이지 | 보여주는 것 / 할 수 있는 것 |
+|---|---|
+| Overview | 라우팅·`live.enabled`·HALT·불일치·보호주문 누락·서명 전 거부 카운터·계정별 키 유무(마스킹)·열린 lot·신호/회신 집계. 30초 자동 새로고침(`?refresh=0` 로 끔) |
+| Signals | 받은 신호 전부(mode/status 필터, 페이지). 신호 하나를 열면 **원본 페이로드, 계정별 run, lot, 주문·체결, 그 `event_id` 를 실은 회신, 중복(`DUPLICATE`)·충돌·만료 접수 기록**이 한 화면 |
+| Orders / Reports / Ingress | 주문(거래소 원문 `raw` 제외), 회신(본문은 길이만), 서명 통과 뒤 거부·중복 로그 + 서명 전 거부 카운터 |
+| Accounts | 계정별 설정 요약, `.env` 의 키 상태(디스크 vs 프로세스; 값은 `set (ABCD… len=18)` 처럼 마스킹), **Save keys**, **Check**(디스크의 키로 읽기 전용 연결 확인, 계정당 10초 1회) |
+| Secrets | `LAKE_SIGNAL_SECRET_*`, `LAKE_REPORT_SECRET/URL_*`(계정별 덮어쓰기 포함), 텔레그램, `ADMIN_TOKEN`(확인어 `ROTATE`) 저장. 빈 칸 = 유지 |
+| Controls | HALT / Resume / 즉시 대사 / `live.enabled` 켜기(확인어 `LIVE`)·끄기 / **Apply & restart**, 마지막 대사 결과, 최근 대시보드 동작 20건 |
+
+**저장 → 재시작 필요.** 대시보드가 쓰는 곳은 서버의 `.env` 와 `config.json` 뿐이다(저장 전에 `config.load` 와 거래소 생성자 드라이런으로 검증,
+원자적 교체, 0600; 쓴 뒤 재검증이 통과하면 `.env.bak` 은 지운다 — 이전 시크릿 사본을 남기지 않는다). 돌고 있는 프로세스는 값을 바꿔 끼우지 않으므로(**핫스왑 없음**) 저장 뒤 노란 "restart required" 배너가 뜨고,
+Controls 의 **Apply & restart** 가 SIGTERM → systemd 재시작(5~10초 동안 웹훅은 502, lake 가 재전송)으로 반영한다. 재시작은 기동 60초 뒤부터,
+60초 간격, 5분에 3회까지. 예외는 `live.enabled` **끄기** 뿐이다(더 보수적인 방향이라 즉시 적용). 재시작 전에 Accounts 의 **Check** 로 새 키가
+거래소에 통하는지 먼저 본다 — 기동에서 실패하는 `.env` 는 서비스를 내려놓는다(exit 2).
+
+이제 **서버의 `.env` 가 진실**이고 로컬 PC 의 `.env` 는 뒤처질 수 있다. 코드만 다시 올릴 때는 `python deploy/finalize.py --keep-remote-env`
+(`--keep-remote-config`) 로 돌려 대시보드에서 넣은 값을 덮어쓰지 않는다. 보안 모델(쿠키·CSRF·공유 실패 예산·`--ui-cidr`)은 `docs/RUNBOOK.md` §9.
 
 ## 절대 커밋 금지 (`.gitignore` 처리됨)
 

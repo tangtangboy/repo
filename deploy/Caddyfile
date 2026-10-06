@@ -1,4 +1,4 @@
-# lake-executor 리버스 프록시. PUBLIC_HOST / ADMIN_ALLOW_CIDR 는 /etc/caddy/env 에서 (setup-server.sh 가 기록).
+# lake-executor 리버스 프록시. PUBLIC_HOST / ADMIN_ALLOW_CIDR / UI_ALLOW_CIDR 는 /etc/caddy/env 에서 (setup-server.sh 가 기록).
 # 자동 HTTPS(Let's Encrypt). 외부는 443 만, 앱은 127.0.0.1:8787 만 듣는다.
 {$PUBLIC_HOST} {
 	# 앱의 max_body_bytes(65536) 보다 넉넉하지만 무제한은 아님
@@ -14,6 +14,25 @@
 	}
 	respond @admin 404
 
+	# 운영 대시보드(/ui) 는 ADMIN_TOKEN 로그인 + CSRF 로 보호되므로 기본은 어디서나 (IPv4+IPv6: "0.0.0.0/0 ::/0";
+	# remote_ip 의 0.0.0.0/0 만으로는 IPv6 피어가 404 를 받는다). 고정 운영자 IP 가 있으면 push.py --ui-cidr <IP>/32 로 잠근다.
+	# {$VAR:default} 는 파싱 전 텍스트 치환이라 공백으로 나뉜 여러 CIDR 도 그대로 인자 목록이 된다.
+	@ui {
+		path /ui /ui/*
+		not remote_ip {$UI_ALLOW_CIDR:0.0.0.0/0 ::/0}
+	}
+	respond @ui 404
+
+	# 대시보드의 Check(거래소 왕복, 재시도 포함 수십 초) 와 Reconcile 은 10초를 넘길 수 있다 → /ui 만 긴 응답 대기.
+	# 같은 directive 끼리는 쓰인 순서대로 평가되므로 이 블록이 기본 블록보다 먼저 와야 한다.
+	@uipath path /ui /ui/*
+	reverse_proxy @uipath 127.0.0.1:8787 {
+		transport http {
+			dial_timeout 2s
+			response_header_timeout 120s
+		}
+	}
+
 	reverse_proxy 127.0.0.1:8787 {
 		transport http {
 			dial_timeout 2s
@@ -21,7 +40,8 @@
 		}
 	}
 
-	# 접근 로그: 관리 토큰·서명 헤더는 기록하지 않는다
+	# 접근 로그: 관리 토큰·서명 헤더·대시보드 세션 쿠키는 기록하지 않는다
+	# (응답 헤더는 최상위 resp_headers 필드에 찍힌다 — response>headers>… 는 존재하지 않는 경로라 조용히 무시된다)
 	log {
 		output file /var/log/caddy/access.log {
 			roll_size 10MiB
@@ -32,6 +52,9 @@
 			fields {
 				request>headers>X-Admin-Token delete
 				request>headers>X-Signature delete
+				request>headers>Cookie delete
+				request>headers>Authorization delete
+				resp_headers>Set-Cookie delete
 			}
 		}
 	}

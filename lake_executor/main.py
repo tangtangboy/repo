@@ -184,7 +184,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         log.exception("recover_processing failed: %s", type(e).__name__)
         alerts.send(f"[serve] recover_processing failed: {type(e).__name__}")
 
-    services = SimpleNamespace(executor=executor, reporter=reporter, alerts=alerts, exchanges=exchanges)
+    # paths/started_ms 는 대시보드(web.py) 가 쓴다: .env/config.json 편집 대상 경로와 재시작 가드의 기준 시각
+    services = SimpleNamespace(executor=executor, reporter=reporter, alerts=alerts, exchanges=exchanges,
+                               paths=SimpleNamespace(env=args.env, config=args.config), started_ms=now_ms())
     app = create_app(settings, store, services)
 
     stop_event = threading.Event()

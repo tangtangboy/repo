@@ -16,9 +16,10 @@
 | 시작 | `ssh_run.py "sudo systemctl start lake-executor"` | `recover_processing` 후 수신·실행·회신·스냅샷 재개 |
 | 정지 | `ssh_run.py "sudo systemctl stop lake-executor"` | SIGTERM → 정상 종료. 수신(HTTPS 는 502)·실행·회신 모두 멈춤. **거래소 포지션·보호주문은 건드리지 않음** |
 | 재시작 | `ssh_run.py "sudo systemctl restart lake-executor"` | 설정/코드 반영 |
-| **HALT (권장 1순위)** | `ssh_run.py "touch /home/ubuntu/lake-executor/state/HALT"` 또는 `POST /admin/halt` | 새 신호를 전부 `rejected/OPERATOR_HALT` 로 회신. 기존 SL/TP 유지. 스냅샷·회신·대사는 계속 |
-| 재개 | `ssh_run.py "rm -f /home/ubuntu/lake-executor/state/HALT"` 또는 `POST /admin/resume` | 즉시 효력 (재시작 불필요) |
-| 설정 반영 | 로컬에서 `.env`/`config.json` 수정 → `python deploy/finalize.py` | 업로드(600) → `check` → 재시작 |
+| **HALT (권장 1순위)** | `ssh_run.py "touch /home/ubuntu/lake-executor/state/HALT"` 또는 `POST /admin/halt` 또는 **대시보드 `https://<host>/ui/controls` → HALT** | 새 신호를 전부 `rejected/OPERATOR_HALT` 로 회신. 기존 SL/TP 유지. 스냅샷·회신·대사는 계속 |
+| 재개 | `ssh_run.py "rm -f /home/ubuntu/lake-executor/state/HALT"` 또는 `POST /admin/resume` 또는 대시보드 Controls → Resume | 즉시 효력 (재시작 불필요) |
+| 설정 반영 | 로컬에서 `.env`/`config.json` 수정 → `python deploy/finalize.py`, 또는 **대시보드 Accounts/Secrets 에서 저장 → Controls → Apply & restart**(§5) | 업로드(600) → `check` → 재시작 / 서버 파일 직접 갱신 → 재시작 |
+| 재시작 (대시보드) | Controls → **Apply & restart** | SIGTERM → 정상 종료 → systemd 가 5초 뒤 재기동. 기동 60초 뒤부터, 60초 간격, 5분 3회 제한 |
 
 HALT 중 접수된 신호는 202 로 받아들여지지만 실행기에서 즉시 거부 회신된다 — lake 는 그 거부를 보고 판단해야 하므로
 **HALT 걸기 전에 lake 에 알리는 것**이 원칙이다. 정지(`stop`) 중에 lake 가 보낸 신호는 Caddy 502 로 접수되지 않는다
@@ -29,6 +30,7 @@ Caddy 는 `/state`, `/admin/*` 를 `ADMIN_ALLOW_CIDR`(기본 `127.0.0.1/32`) 밖
 `ssh_run.py "curl -s -H 'X-Admin-Token: …' -X POST http://127.0.0.1:8787/admin/halt"` 로 쓴다. 외부에서 쓰려면
 `python deploy/push.py --admin-cidr <운영자IP>/32` 로 허용 CIDR 을 넣고 HTTPS 로만 호출하며, 토큰을 쉘 히스토리에 남기지 않는다.
 같은 IP 에서 토큰 실패가 60초에 10회를 넘으면 그 창이 지날 때까지 401 만 돌아온다.
+브라우저에서는 **`https://<host>/ui`** (운영 대시보드, 같은 `ADMIN_TOKEN` 으로 로그인) 가 같은 일을 폼으로 한다 — 보안 모델은 §9.
 
 ## 2. 로그
 
@@ -56,6 +58,9 @@ python deploy/ssh_run.py "curl -s -H 'X-Admin-Token: <token>' http://127.0.0.1:8
 `protection_missing` 이 0 이 아니면 보호가격이 설정된 open lot 에 보호주문이 빠져 있다는 뜻이다(생성 실패/거래소 쪽 취소).
 30초 대사가 자동으로 다시 만들며 실패하면 `PROTECTION_FAILED` 알림이 반복된다 → 해당 거래소 화면에서 조건부 주문
 (Bybit 조건부 / OKX 알고 주문 / Toobit 은 포지션 TP/SL) 을 확인한다.
+
+**`/ui` 는 `/state` 의 사람용 화면이다**: Overview = 아래 플래그·집계, Signals/Orders/Reports/Ingress = 원장 테이블(신호 상세에 run·lot·주문·체결·회신·중복 접수가 한 화면),
+Accounts = 계정별 키 상태(마스킹)·연결 확인, Controls = 대사 결과(`positions` vs `exchange_positions`). JSON 이 필요하면 `/state` 를 쓴다.
 
 `/state` 주요 키:
 
@@ -153,16 +158,25 @@ Toobit 은 lot 단위 조건부 주문이 아니라 **포지션 단위 TP/SL(tra
 
 ## 5. 키 교체 (rotation)
 
-**공유 시크릿(lake 와 양방향)**: 새 값을 대역 외 채널로 교환 → 양쪽이 합의한 시각에 동시에 교체. 우리 쪽은 `.env` 수정 →
-`python deploy/finalize.py`(재시작 수 초, 그 사이 신호는 502 → lake 재전송 정책). 교체 직후 lake 에 `mode:test` 신호 1건을
-보내 202 를 확인하고, 우리 회신이 `sent` 로 바뀌는지 `/state` 로 확인한다. 순서: TEST 먼저, 문제 없으면 LIVE.
+두 경로가 있고 결과는 같다(서버 `.env` 갱신 → 재시작). **서버의 `.env` 가 진실**이다 — 대시보드로 바꾼 뒤에는 로컬 PC 의 `.env` 가
+뒤처지므로 이후 `finalize.py` 는 `--keep-remote-env` 로 돌린다(플래그 없이 돌리면 로컬 값으로 덮어쓴다).
+
+| | 대시보드 경로 (`https://<host>/ui`) | `finalize.py` 경로 |
+|---|---|---|
+| 거래소 키 | Accounts → 계정 카드에 키 입력 → **Save keys**(저장 전 `config.load` + 거래소 생성자 드라이런 검증; 쓴 뒤 재검증이 통과하면 `.env.bak` 은 지운다) → Accounts → **Check**(디스크의 새 키로 instrument/시세/포지션 읽기) → Controls → **Apply & restart** → 재기동 뒤 Accounts/Overview 에서 `has_real_keys`·`exchange_ready` 확인 | 로컬 `.env` 수정 → `python deploy/finalize.py`(`check` 통과 뒤 서비스가 뜬다) |
+| lake 시크릿 / 회신 URL / 텔레그램 | Secrets → 값 입력(빈 칸 = 유지) → Save → Apply & restart | 로컬 `.env` 수정 → `finalize.py` |
+| ADMIN_TOKEN | Secrets → Rotate ADMIN_TOKEN(확인어 `ROTATE`) → Apply & restart → **모든 세션이 무효가 되므로 새 토큰으로 다시 로그인** | 로컬 `.env` 수정 → `finalize.py` |
+| `live.enabled` | Controls → Enable LIVE(확인어 `LIVE`, 재시작 필요) / Disable LIVE(즉시 적용 + 파일 기록) | `config.json` 수정 → `finalize.py` |
+
+**공유 시크릿(lake 와 양방향)**: 새 값을 대역 외 채널로 교환 → 양쪽이 합의한 시각에 동시에 교체(재시작 수 초, 그 사이 신호는 502 → lake 재전송 정책).
+교체 직후 lake 에 `mode:test` 신호 1건을 보내 202 를 확인하고, 우리 회신이 `sent` 로 바뀌는지 `/ui/reports` 또는 `/state` 로 확인한다.
+순서: TEST 먼저, 문제 없으면 LIVE.
 
 **거래소 API 키**(Bybit/OKX/Toobit 공통): 그 계정에 포지션이 없는 시각(또는 HALT 상태)에 한다.
-1. 거래소에서 새 키 생성(§6 권한·IP; OKX 는 새 passphrase 도 함께), 2. `.env` 의 `{PREFIX}_API_KEY/_API_SECRET(/_API_PASSPHRASE)`
-교체 → `finalize.py`(`check` 통과 뒤 서비스가 뜬다), 3. `/state` 의 `exchange_positions` 와 `open_lots` 일치 확인, 4. 옛 키 삭제.
-열린 보호주문(Toobit 은 포지션 TP/SL 설정)은 계정 소속이므로 키 교체에 영향 없다.
-
-**ADMIN_TOKEN / 텔레그램 토큰**: `.env` 교체 → `finalize.py`.
+1. 거래소에서 새 키 생성(§6 권한·IP; OKX 는 새 passphrase 도 함께), 2. 위 표의 한 경로로 `{PREFIX}_API_KEY/_API_SECRET(/_API_PASSPHRASE)` 교체,
+3. 재기동 뒤 Accounts 의 Check 또는 `/state` 의 `exchange_positions` 와 `open_lots` 일치 확인, 4. 옛 키 삭제.
+열린 보호주문(Toobit 은 포지션 TP/SL 설정)은 계정 소속이므로 키 교체에 영향 없다. 대시보드 Check 가 `FAILED (...)` 면 **재시작하지 말고**
+키/IP 화이트리스트를 고친다 — 기동에서 거래소 생성이 실패하는 `.env` 는 서비스를 내려놓는다(exit 2, systemd 가 재시작하지 않음).
 
 ## 6. 계정 추가 · 거래소별 API 키 권한 · IP 화이트리스트
 
@@ -286,3 +300,35 @@ lake 는 현재 `exchange:"Bybit"` 만 보내므로 `by_exchange` 는 lake 가 �
 - `serve` 는 실키가 있는 enabled 계정의 실거래소를 만들지 못하면(`python-okx` 미설치 등) 설정 오류(exit 2)로 멈춘다 — `pip install -r requirements.txt` 뒤 `check` 로 확인.
 - 배포 스크립트의 SSH 는 `deploy/known_hosts` 의 호스트 키만 신뢰한다. 인스턴스를 재생성해 키가 바뀌면 "HOST KEY MISMATCH" 로
   거부되므로 그 줄을 지우고 지문을 확인한 뒤 `--trust-new-host-key` 로 다시 기록한다.
+- 대시보드의 Apply & restart 도 같은 경로(SIGTERM → exit 0 → `Restart=always` 5초)다. 재시작 요청 이력은 원장 `meta` 의 `ui_restarts` 에 남아
+  재시작을 넘겨서도 "60초 간격, 5분 3회" 제한이 유지된다(`StartLimitBurst=5/300s` 아래). 저장만 하고 재시작하지 않은 값("restart required" 배너)은
+  디스크에만 있고, 배너는 재시작하면 사라진다.
+
+## 9. 대시보드 보안 (`/ui`)
+
+- **켜짐 조건**: `.env` 에 `ADMIN_TOKEN`(32바이트 이상) 이 있을 때만. 없으면 `/ui`, `/ui/login` 까지 전부 404(`/admin/*` 와 동일 정책).
+- **노출**: Caddy 는 `/ui` 를 `UI_ALLOW_CIDR`(기본 `0.0.0.0/0 ::/0`, IPv4+IPv6) 로 거른다. 로그인만으로 보호되는 공개 폼이므로 운영자 IP 가 고정이면
+  `python deploy/push.py --ui-cidr <IP>/32` 로 잠그는 것을 권장한다(`--admin-cidr` 는 `/state`, `/admin/*` 만 다룬다; IPv4 만 적으면 IPv6 피어는 404).
+  HTTPS 로만 접근한다. 앱은 `X-Forwarded-For`/`X-Forwarded-Proto` 를 피어가 루프백(=Caddy) 일 때만 믿으므로 `listen.host` 는 `127.0.0.1` 로 둔다.
+  `/ui` 아래의 등록되지 않은 경로·메서드도 같은 404 정책(토큰 미설정) 과 보안 헤더를 받는다(Starlette 기본 404/405 없음).
+- **로그인**: 토큰은 폼 본문에서만 받는다(쿼리/헤더 무시). 실패는 `/admin/*` 의 X-Admin-Token 실패와 **같은 IP 별 예산**(60초 10회)을 소모하며,
+  한도를 넘기면 올바른 토큰도 창이 지날 때까지 401 이다. 그 반대(관리 API 실패 → 로그인 차단)도 같다.
+- **세션 쿠키** `lake_ui`: `sid.exp_ms.sig`, 키는 ADMIN_TOKEN 에서 파생(HMAC). 속성 `Path=/ui; HttpOnly; SameSite=Strict; Max-Age=43200`,
+  HTTPS(또는 Caddy 의 `X-Forwarded-Proto: https`) 면 `Secure`. 12시간 절대 만료. 서버 상태가 없으므로 **재시작을 넘겨 유지**되고,
+  **ADMIN_TOKEN 을 바꾸면(재시작 뒤) 모든 세션이 무효**다. 로그아웃은 메모리 revoke 목록이라 재시작하면 잊히지만 12시간 만료로 상한이 있다.
+- **플래시 배너**: 저장/HALT 등의 "완료" 배너(`?flash=`) 는 같은 세션이 60초 안에 서명(`fat`/`fsig`, 세션 키 HMAC) 한 것만 띄운다.
+  링크를 꾸며 운영자에게 가짜 확인 문구를 보일 수 없다(서명 없는/만료된 flash 는 무시).
+- **CSRF**: 모든 POST 는 세션에서 파생한 `_csrf` 필드가 필요하고, 실패도 토큰 실패 예산을 소모한다. 폼은 `application/x-www-form-urlencoded`
+  16KB 이하만 받는다(아니면 415/413).
+- **응답 헤더**: `Cache-Control: no-store`, CSP `default-src 'none'`(인라인 스타일만, 스크립트 없음), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
+  Caddy 접근 로그는 `Cookie`/`Set-Cookie`/`Authorization`/`X-Admin-Token`/`X-Signature` 를 지운다.
+- **시크릿 비노출**: 어떤 페이지·플래시·알림·로그에도 값이 실리지 않는다(앞 4자 + 길이의 마스킹만, URL 은 호스트만). 입력란은 미리 채우지 않고
+  제출값은 되돌려 보내지 않는다. 거래소 예외는 코드/타입 이름만 보인다. 로그 포맷터의 `***` 마스킹은 안전망으로 남아 있다.
+- **교체 전 값은 남기지 않는다**: `.env` 저장은 임시 파일 → 재검증(`config.load`) → 교체 순서이고, 재검증이 통과하면 교체 직전 값을 담은
+  `.env.bak` 을 바로 지운다(실패하면 `.env.bak` 으로 되돌린다). 따라서 키 교체 뒤 디스크에는 **이전 ADMIN_TOKEN/API 시크릿 사본이 남지 않으며**
+  되돌리려면 새 값을 다시 입력해야 한다. 저장은 프로세스 안에서 한 번에 하나만 진행된다(겹친 제출은 순서대로).
+- **쓰기 제한**: 편집 가능한 키는 `config.load` 가 아는 키의 화이트리스트뿐(그 외 `BAD_KEY`). 계정 추가/삭제·`env_prefix`·가드·라우팅은 UI 에서
+  바꿀 수 없다(파일로). 신호 생성/재생, 수동 주문, 거래소 쓰기 동작은 없다. 적용은 재시작뿐이며 유일한 즉시 변경은 `live.enabled=false` 다.
+- **재시작 제한**: 기동 60초 뒤부터, 60초 간격, 5분 3회(`PROCESS_TOO_YOUNG` / `TOO_SOON` / `RATE_LIMITED` 로 429). 대사는 동시 1건, 5초 간격.
+  계정 연결 확인은 계정당 10초 1회.
+- **감사**: 모든 동작은 `ui: … by <ip>` WARNING 로그 + `[admin] … via dashboard` 알림(텔레그램 설정 시) + Controls 의 최근 20건(이름/IP/시각만).

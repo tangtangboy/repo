@@ -12,7 +12,7 @@ lake-executor 를 AWS EC2(서울, ap-northeast-2) 에 올려 24시간 돌리는 
 | `ssh_run.py` | 서버에서 명령 하나 실행 (상태 확인·HALT·로그) |
 | `sshutil.py` | 공용 SSH 연결: 호스트 키를 `deploy/known_hosts` 에 고정 (첫 접속 지문 확인, 이후 불일치 거부) |
 | `setup-server.sh` | 서버 쪽 1회 설정 스크립트 (push.py 가 호출, 재실행 안전) |
-| `Caddyfile` | `{$PUBLIC_HOST}` → `reverse_proxy 127.0.0.1:8787` |
+| `Caddyfile` | `{$PUBLIC_HOST}` → `reverse_proxy 127.0.0.1:8787`; `/state`,`/admin/*` 는 `ADMIN_ALLOW_CIDR`, `/ui` 는 `UI_ALLOW_CIDR` 로 거른다 |
 | `lake-executor.service` | systemd 유닛 (`User=ubuntu`, `Restart=always`) |
 
 **절대 커밋 금지** (`.gitignore` 처리됨): `deploy/aws_state.json`, `deploy/*.pem`, `.env`, `config.json`.
@@ -101,6 +101,13 @@ python deploy/push.py
   → `deploy/known_hosts` 의 해당 줄을 지우고 다시 확인한다. `.env` 를 SFTP 로 올리는 `finalize.py` 도 같은 규칙이다.
 - `/state`, `/admin/*` 는 Caddy 에서 기본적으로 서버 로컬(127.0.0.1/32)만 허용한다. 외부 운영 PC 에서 쓰려면
   `python deploy/push.py --admin-cidr <PC공인IP>/32` (aws_state.json 에 기억된다).
+- 운영 대시보드 `https://<PUBLIC_HOST>/ui` 는 기본적으로 어디서나 열리고 `ADMIN_TOKEN` 로그인이 보호한다(`UI_ALLOW_CIDR` 기본 `0.0.0.0/0 ::/0`,
+  IPv4+IPv6). 운영 PC IP 가 고정이면 `python deploy/push.py --ui-cidr <PC공인IP>/32` 로 잠근다(`--admin-cidr` 와 별개; 둘 다 aws_state.json 에 기억).
+  `--ui-cidr` 에 IPv4 만 적으면 IPv6 로 접속하는 운영자는 404 를 받는다(AAAA 레코드가 있는 도메인을 쓸 때는 IPv6 접두사도 함께).
+  Caddy 접근 로그는 `Cookie`/`Set-Cookie`(`resp_headers>Set-Cookie`)/`Authorization` 헤더를 지우도록 필터링된다(토큰·서명 헤더와 같은 취급).
+  `/ui` 는 별도 `reverse_proxy` 블록으로 응답 대기 120초(Check/Reconcile 의 거래소 왕복), 나머지는 10초.
+- **`config.json` 의 `listen.host` 는 `127.0.0.1` 로 둔다.** 앱은 `X-Forwarded-For`/`X-Forwarded-Proto` 를 TCP 피어가 루프백(=같은 호스트의
+  Caddy) 일 때만 믿는다. 다른 주소로 듣게 하면 헤더를 믿지 않으므로 로그인 실패 예산은 피어 IP 기준이 되고, 쿠키의 `Secure` 는 붙지 않는다.
 - 코드를 고친 뒤 다시 올릴 때도 `push.py` (또는 `finalize.py` — 패키지를 같이 올린다) 를 쓴다.
 
 ## 4. 비밀값 작성 (로컬)
@@ -127,6 +134,9 @@ python deploy/finalize.py
 순서: 소스 동기화 + `.env`/`config.json` 업로드(`chmod 600`) → `python -m lake_executor check`(읽기 전용, 주문 없음)
 → 통과 시 `systemctl enable --now lake-executor` + restart, `systemctl restart caddy` → `is-active`, `journalctl -n 30`, `/healthz` 출력.
 
+- **대시보드(/ui) 에서 키를 넣은 뒤**에는 서버 `.env`/`config.json` 이 진실이다. 코드만 다시 올릴 때는
+  `python deploy/finalize.py --keep-remote-env` (`--keep-remote-config`) 로 돌려 서버 값을 덮어쓰지 않는다 — 플래그 없이 돌리면
+  로컬 파일로 덮어쓴다(실행 시작 때 REMINDER 로 알려 준다).
 - `check` 가 실패하면 서비스를 켜지 않는다. 흔한 원인: Bybit 키 IP 화이트리스트 누락, 시크릿 길이 < 32, 회신 URL 오타,
   OKX 키는 있는데 `OKX_API_PASSPHRASE` 누락, Toobit 계정에 `position_mode` 가 `hedge` 가 아님(설정 오류 exit 2).
   `check` 는 실키가 있는 모든 계정(Bybit/OKX/Toobit)에 대해 읽기 전용으로 instrument·시세·포지션을 읽으므로 키·IP 화이트리스트
@@ -158,7 +168,7 @@ python deploy/ssh_run.py "cd /home/ubuntu/lake-executor && ./.venv/bin/python -m
   python deploy/ssh_run.py "touch /home/ubuntu/lake-executor/state/HALT"
   python deploy/ssh_run.py "rm -f /home/ubuntu/lake-executor/state/HALT"     # 재개
   ```
-  (`ADMIN_TOKEN` 을 설정했다면 `POST https://<host>/admin/halt` / `/admin/resume` 도 같은 효과.)
+  (`ADMIN_TOKEN` 을 설정했다면 `POST https://<host>/admin/halt` / `/admin/resume`, 또는 브라우저 `https://<host>/ui/controls` 의 HALT/Resume 도 같은 효과.)
 - **서비스 정지** — 수신(HTTPS 는 502)·실행·회신 모두 멈춘다. 거래소 포지션/보호주문은 건드리지 않는다.
   ```powershell
   python deploy/ssh_run.py "sudo systemctl stop lake-executor"

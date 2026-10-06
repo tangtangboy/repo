@@ -9,6 +9,9 @@ setup-server.sh: venv + 의존성, Caddy(공식 apt 저장소) 설치, /etc/cadd
     python deploy/push.py --host hook.example.com   # 직접 도메인 사용 (DNS A 레코드 → Elastic IP 먼저)
     python deploy/push.py --no-setup            # 파일만 올리고 setup-server.sh 는 생략
     python deploy/push.py --admin-cidr 1.2.3.4/32   # /state, /admin/* 를 외부에서 쓸 운영자 IP (기본: 서버 로컬만)
+    python deploy/push.py --ui-cidr 1.2.3.4/32      # 운영 대시보드 /ui 를 그 IP 에서만 (기본 "0.0.0.0/0 ::/0" = 로그인만으로 보호)
+--admin-cidr 는 여전히 /state, /admin/* 만 다룬다. /ui 를 같은 PC 로 잠그려면 --ui-cidr <PC IP>/32 를 따로 준다.
+둘 다 aws_state.json 에 기억된다(admin_allow_cidr / ui_allow_cidr).
 첫 접속은 호스트 키 지문을 보여 주고 확인을 받아 deploy/known_hosts 에 기록한다 (--trust-new-host-key 로 생략 가능).
 """
 from __future__ import annotations
@@ -22,7 +25,7 @@ import sys
 import paramiko
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sshutil import add_trust_arg, connect as _ssh_connect, load_state  # noqa: E402  (호스트 키 고정 SSH)
+from sshutil import add_trust_arg, connect as _ssh_connect, load_state, sftp_put_normalized  # noqa: E402  (호스트 키 고정 SSH)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -99,7 +102,7 @@ def upload(cli: paramiko.SSHClient, rels: list[str]) -> None:
             if rdir not in made:
                 run(cli, f"mkdir -p '{rdir}'", echo=False)
                 made.add(rdir)
-            sftp.put(os.path.join(ROOT, rel.replace("/", os.sep)), remote)
+            sftp_put_normalized(sftp, os.path.join(ROOT, rel.replace("/", os.sep)), remote)
             print("uploaded", rel)
     finally:
         sftp.close()
@@ -116,6 +119,9 @@ def main() -> None:
     ap.add_argument("--no-setup", action="store_true", help="upload only; do not run setup-server.sh")
     ap.add_argument("--admin-cidr", default=None,
                     help="CIDR allowed to reach /state and /admin/* through Caddy (default 127.0.0.1/32 = server only)")
+    ap.add_argument("--ui-cidr", default=None,
+                    help="CIDR(s) allowed to reach the /ui dashboard through Caddy (space-separated; default '0.0.0.0/0 ::/0'; "
+                         "login still required; an IPv4-only value makes /ui 404 for IPv6 peers)")
     add_trust_arg(ap)
     args = ap.parse_args()
 
@@ -139,8 +145,10 @@ def main() -> None:
             return
 
         admin_cidr = args.admin_cidr or os.environ.get("ADMIN_ALLOW_CIDR") or state.get("admin_allow_cidr") or ""
-        print(f"\n--- setup-server.sh (PUBLIC_HOST={public_host} ADMIN_ALLOW_CIDR={admin_cidr or '127.0.0.1/32'}) ---")
-        code, _, _ = run(cli, f"cd {REMOTE} && bash deploy/setup-server.sh '{public_host}' '{admin_cidr}'")
+        ui_cidr = args.ui_cidr or os.environ.get("UI_ALLOW_CIDR") or state.get("ui_allow_cidr") or ""
+        print(f"\n--- setup-server.sh (PUBLIC_HOST={public_host} ADMIN_ALLOW_CIDR={admin_cidr or '127.0.0.1/32'} "
+              f"UI_ALLOW_CIDR={ui_cidr or '0.0.0.0/0 ::/0'}) ---")
+        code, _, _ = run(cli, f"cd {REMOTE} && bash deploy/setup-server.sh '{public_host}' '{admin_cidr}' '{ui_cidr}'")
         if code != 0:
             print("\n!! setup-server.sh failed (exit", code, ")")
             sys.exit(code)
@@ -153,6 +161,9 @@ def main() -> None:
         if admin_cidr and state.get("admin_allow_cidr") != admin_cidr:
             state["admin_allow_cidr"] = admin_cidr
             changed = True
+        if ui_cidr and state.get("ui_allow_cidr") != ui_cidr:
+            state["ui_allow_cidr"] = ui_cidr
+            changed = True
         if changed:
             with open(STATE_PATH, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2)
@@ -161,6 +172,7 @@ def main() -> None:
         print("host        :", state["public_ip"])
         print("public host :", public_host)
         print("signal URL  :", f"https://{public_host}/lake/signal")
+        print("dashboard   :", f"https://{public_host}/ui  (ADMIN_TOKEN login; 404 until .env has ADMIN_TOKEN)")
         print("Next: fill .env + config.json locally, then  python deploy/finalize.py")
     finally:
         cli.close()

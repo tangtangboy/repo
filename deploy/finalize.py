@@ -10,6 +10,10 @@
     python deploy/finalize.py
     python deploy/finalize.py --env .env.live --config config.live.json
     python deploy/finalize.py --skip-check      # check 실패를 무시 (비권장)
+    python deploy/finalize.py --keep-remote-env # 서버 .env 는 그대로 두고 코드/config 만 (대시보드 /ui 에서 넣은 키를 지키는 길)
+    python deploy/finalize.py --keep-remote-env --keep-remote-config   # 코드만 재배포
+
+운영 대시보드(/ui) 가 저장한 값은 **서버의** .env/config.json 에만 있다. 플래그 없이 돌리면 로컬 파일이 그 값을 덮어쓴다.
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ import sys
 import paramiko
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sshutil import add_trust_arg, connect, load_state  # noqa: E402  (호스트 키 고정 SSH)
+from sshutil import add_trust_arg, connect, load_state, sftp_put_normalized  # noqa: E402  (호스트 키 고정 SSH)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -66,12 +70,25 @@ def main() -> None:
     ap.add_argument("--env", default=os.path.join(ROOT, ".env"), help="local .env to upload")
     ap.add_argument("--config", default=os.path.join(ROOT, "config.json"), help="local config.json to upload")
     ap.add_argument("--skip-check", action="store_true", help="start service even if check fails (not recommended)")
+    ap.add_argument("--keep-remote-env", action="store_true",
+                    help="do not upload .env (keep the server copy, e.g. keys saved from the /ui dashboard)")
+    ap.add_argument("--keep-remote-config", action="store_true",
+                    help="do not upload config.json (keep the server copy, e.g. live.enabled set from the /ui dashboard)")
     add_trust_arg(ap)
     args = ap.parse_args()
 
-    for p in (args.env, args.config):
+    uploads = []
+    if not args.keep_remote_env:
+        uploads.append((args.env, f"{REMOTE}/.env"))
+    if not args.keep_remote_config:
+        uploads.append((args.config, f"{REMOTE}/config.json"))
+    for p, _ in uploads:
         if not os.path.exists(p):
             raise SystemExit(f"missing {p} — copy from .env.example / config.example.json and fill it in")
+    print("REMINDER: values saved from the /ui dashboard live only in the server .env/config.json; "
+          "this run " + ("keeps them (--keep-remote-*)." if args.keep_remote_env and args.keep_remote_config else
+                         "OVERWRITES " + " and ".join(os.path.basename(r) for _, r in uploads)
+                         + " with your local copy. Use --keep-remote-env / --keep-remote-config to keep the server values."))
 
     state = load_state()
     cli = connect(state, trust_new=args.trust_new_host_key)   # known_hosts 대조; 첫 접속은 지문 확인 후 기록
@@ -88,12 +105,13 @@ def main() -> None:
                 if rdir not in made:
                     run(cli, f"mkdir -p '{rdir}'", echo=False)
                     made.add(rdir)
-                sftp.put(os.path.join(ROOT, rel.replace("/", os.sep)), remote)
-            sftp.put(args.env, f"{REMOTE}/.env")
-            sftp.put(args.config, f"{REMOTE}/config.json")
+                sftp_put_normalized(sftp, os.path.join(ROOT, rel.replace("/", os.sep)), remote)
+            for local, remote in uploads:
+                sftp_put_normalized(sftp, local, remote)
         finally:
             sftp.close()
-        run(cli, f"chmod 600 {REMOTE}/.env {REMOTE}/config.json && echo 'code + .env + config.json uploaded'")
+        run(cli, f"chmod 600 {REMOTE}/.env {REMOTE}/config.json 2>/dev/null; echo 'code uploaded"
+                 + "".join(f" + {os.path.basename(r)}" for _, r in uploads) + "'")
         run(cli, f"find {REMOTE}/lake_executor -name __pycache__ -type d -prune -exec rm -rf {{}} + 2>/dev/null; true",
             echo=False)
 

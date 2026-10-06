@@ -17,7 +17,9 @@
     는 store.log_ingress(code, event_id, body) 로 남긴다(본문은 sha256 만). ingress_log 는 실행기가 주기적으로 정리한다.
   - 응답/INFO 로그에 시크릿·원본 본문·내부 예외 원문을 넣지 않는다. 로그에 찍는 event_id 는 ID 패턴을 통과한 값만.
   - 관리 엔드포인트는 X-Admin-Token(상수 시간 비교) 필요, ADMIN_TOKEN 미설정 시 404. 같은 IP 의 실패가 잦으면 잠시 비교 없이 401.
+  - 서명 통과 뒤 같은 (mode, event_id)+같은 본문의 재수신(200 duplicate) 도 ingress_log 에 DUPLICATE 로 남긴다 (대시보드 추적용).
   - import 시 부작용 없음: create_app(settings, store, services) 로만 앱을 만든다.
+  - 운영 대시보드(/ui, web.py) 는 create_app 끝에서 mount 되며 같은 admin_throttle 과 app.state.admin_ops(halt/resume/reconcile) 를 공유한다.
 
 services: executor / reporter / alerts 핸들을 담은 간단한 객체 또는 dict (전부 선택).
 
@@ -32,11 +34,13 @@ from __future__ import annotations
 
 import collections
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import re
 import threading
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -155,11 +159,28 @@ class _AdminThrottle:
             self._fails.setdefault(ip, collections.deque()).append(now_ms())
 
 
+def _peer_is_loopback(request: Request) -> bool:
+    """TCP 피어가 루프백(127.0.0.0/8, ::1) 인가. Caddy 는 같은 호스트에서 127.0.0.1:8787 로 프록시하므로
+    X-Forwarded-* 헤더는 이 경우에만 믿는다(아니면 누구나 헤더로 IP/프로토콜을 꾸밀 수 있다)."""
+    host = request.client.host if request.client else None
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
 def _client_ip(request: Request) -> str:
+    """속도 제한·감사 로그에 쓰는 클라이언트 IP. X-Forwarded-For 의 첫 항목은 피어가 루프백(=Caddy) 일 때만 쓴다.
+    listen.host 가 루프백이 아니면 피어 주소를 그대로 쓴다 (헤더를 꾸며도 예산을 피할 수 없다)."""
+    host = (request.client.host if request.client else None) or ""
     xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip() or "?"
-    return (request.client.host if request.client else None) or "?"
+    if xff and _peer_is_loopback(request):
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+    return host or "?"
 
 
 # --------------------------------------------------------------------------- #
@@ -318,6 +339,7 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
     stats = IngressStats()
     app.state.ingress_stats = stats
     admin_throttle = _AdminThrottle()
+    app.state.admin_throttle = admin_throttle   # /ui/login 과 같은 IP 별 실패 예산을 공유한다 (web.py)
 
     def _log_ingress(code: str, event_id: str | None, body: bytes | None, status: int) -> None:
         try:
@@ -424,6 +446,7 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
                      sig.mode.value, sig.event_id, sig.position_id, sig.event_sequence, sig.action.value)
             return _json(202, {"accepted": True, "event_id": sig.event_id})
         if result == "duplicate":
+            _log_ingress("DUPLICATE", sig.event_id, raw, 200)   # 서명 통과 뒤이므로 DB 기록 (대시보드 추적용)
             log.info("signal duplicate mode=%s event_id=%s", sig.mode.value, sig.event_id)
             return _json(200, {"accepted": True, "duplicate": True})
         code = "EVENT_ID_CONFLICT" if result == "conflict" else "SEQUENCE_CONFLICT"
@@ -599,49 +622,36 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
                 out["exchange_positions"][m][acct.name] = out["accounts"][acct.name]["modes"][m]["exchange_positions"]
         return _json(200, out)
 
-    @app.post("/admin/halt")
-    def admin_halt(request: Request):
-        denied = _admin_gate(request)
-        if denied is not None:
-            return denied
-        _write_halt(settings, True, note="admin")
-        log.warning("admin: HALT set")
+    def _alert(text: str) -> None:
         alerts = _svc(services, "alerts")
         if alerts is not None:
             try:
-                alerts.send("[admin] HALT set via /admin/halt")
+                alerts.send(text)
             except Exception:  # noqa: BLE001
                 pass
-        return _json(200, {"ok": True, "halted": True})
 
-    @app.post("/admin/resume")
-    def admin_resume(request: Request):
-        denied = _admin_gate(request)
-        if denied is not None:
-            return denied
+    # ---- 관리 동작 본체 (JSON 엔드포인트와 /ui 대시보드가 공유; source 는 "/admin/halt" | "dashboard" 등 출처 표시) ----
+    def _do_halt(source: str) -> dict:
+        _write_halt(settings, True, note=source)
+        log.warning("admin: HALT set")
+        _alert(f"[admin] HALT set via {source}")
+        return {"ok": True, "halted": True}
+
+    def _do_resume(source: str) -> dict:
         _write_halt(settings, False)
         log.warning("admin: HALT cleared")
-        alerts = _svc(services, "alerts")
-        if alerts is not None:
-            try:
-                alerts.send("[admin] HALT cleared via /admin/resume")
-            except Exception:  # noqa: BLE001
-                pass
-        return _json(200, {"ok": True, "halted": False})
+        _alert(f"[admin] HALT cleared via {source}")
+        return {"ok": True, "halted": False}
 
-    @app.post("/admin/reconcile")
-    def admin_reconcile(request: Request, mode: str = "live", account: str | None = None):
-        """?mode=test|live[&account=name] — account 생략 시 그 모드에 거래소가 있는 모든 계정을 차례로 대사."""
-        denied = _admin_gate(request)
-        if denied is not None:
-            return denied
+    def _do_reconcile(mode: str, account: str | None) -> tuple[int, dict]:
+        """(http status, body). mode ∉ MODES / 모르는 account → 400, executor 없음 → 503, 대사 예외 → 500."""
         if mode not in MODES:
-            return _json(400, {"error": "BAD_REQUEST", "code": "BAD_MODE"})
+            return 400, {"error": "BAD_REQUEST", "code": "BAD_MODE"}
         if account is not None and account not in account_names:
-            return _json(400, {"error": "BAD_REQUEST", "code": "BAD_ACCOUNT"})
+            return 400, {"error": "BAD_REQUEST", "code": "BAD_ACCOUNT"}
         executor = _executor()
         if executor is None:
-            return _json(503, {"error": "EXECUTOR_UNAVAILABLE"})
+            return 503, {"error": "EXECUTOR_UNAVAILABLE"}
         if account is None:
             names = [n for n in account_names if _exchange_of(executor, mode, n) is not None]
         else:
@@ -653,7 +663,7 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
                 consistent = bool(executor.reconcile(mode, name))
             except Exception as e:  # noqa: BLE001
                 log.error("admin reconcile(%s/%s) failed: %s", mode, name, type(e).__name__)
-                return _json(500, {"error": "INTERNAL", "code": "RECONCILE_FAILED", "account": name})
+                return 500, {"error": "INTERNAL", "code": "RECONCILE_FAILED", "account": name}
             all_ok = all_ok and consistent
             results[name] = {
                 "consistent": consistent,
@@ -663,7 +673,7 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
                 "exchange_positions": _exchange_positions(executor, mode, name),
             }
             log.warning("admin: reconcile(%s/%s) -> consistent=%s", mode, name, consistent)
-        return _json(200, {
+        return 200, {
             "ok": all_ok,
             "mode": mode,
             "account": account,
@@ -673,6 +683,35 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
             "accounts": results,
             "positions": {n: r["positions"] for n, r in results.items()},
             "exchange_positions": {n: r["exchange_positions"] for n, r in results.items()},
-        })
+        }
+
+    app.state.admin_ops = SimpleNamespace(halt=_do_halt, resume=_do_resume, reconcile=_do_reconcile)
+
+    @app.post("/admin/halt")
+    def admin_halt(request: Request):
+        denied = _admin_gate(request)
+        if denied is not None:
+            return denied
+        return _json(200, _do_halt("/admin/halt"))
+
+    @app.post("/admin/resume")
+    def admin_resume(request: Request):
+        denied = _admin_gate(request)
+        if denied is not None:
+            return denied
+        return _json(200, _do_resume("/admin/resume"))
+
+    @app.post("/admin/reconcile")
+    def admin_reconcile(request: Request, mode: str = "live", account: str | None = None):
+        """?mode=test|live[&account=name] — account 생략 시 그 모드에 거래소가 있는 모든 계정을 차례로 대사."""
+        denied = _admin_gate(request)
+        if denied is not None:
+            return denied
+        status, body = _do_reconcile(mode, account)
+        return _json(status, body)
+
+    # ------------------------------------------------------------------ 운영 대시보드 (/ui)
+    from .web import mount  # 함수 안 import: web → receiver 순환 import 회피
+    mount(app, settings, store, services, admin_throttle)
 
     return app

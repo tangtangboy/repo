@@ -126,3 +126,29 @@ def connect(state: dict, *, trust_new: bool = False, retries: int = 1, delay: in
 def add_trust_arg(parser) -> None:
     parser.add_argument("--trust-new-host-key", action="store_true",
                         help="first connection only: record the presented host key after printing its fingerprint")
+
+
+TEXT_SUFFIXES = (".py", ".sh", ".txt", ".json", ".md", ".service", ".example", ".yaml", ".yml", ".toml", ".html", ".cfg", ".ini")
+TEXT_NAMES = ("Caddyfile", ".env", ".gitattributes")
+CRLF = bytes([13, 10])
+LF = bytes([10])
+
+
+def is_text_upload(local_path: str) -> bool:
+    name = os.path.basename(local_path)
+    return name in TEXT_NAMES or name.startswith(".env") or name.lower().endswith(TEXT_SUFFIXES)
+
+
+def sftp_put_normalized(sftp, local_path: str, remote_path: str) -> None:
+    """SFTP 업로드. 텍스트 파일은 CRLF -> LF 로 바꿔 올린다.
+    Windows 체크아웃(core.autocrlf=true)이 .sh/Caddyfile 을 CRLF 로 만들어 서버에서
+    set -o pipefail 줄이 CR 때문에 깨지던 문제를 업로드 단계에서 차단한다."""
+    if not is_text_upload(local_path):
+        sftp.put(local_path, remote_path)
+        return
+    with open(local_path, "rb") as f:
+        data = f.read()
+    if CRLF in data:
+        data = data.replace(CRLF, LF)
+    import io as _io
+    sftp.putfo(_io.BytesIO(data), remote_path)

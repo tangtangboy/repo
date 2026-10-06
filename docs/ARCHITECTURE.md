@@ -36,11 +36,19 @@ lake ──POST /lake/signal (X-Signature/X-Timestamp)──▶ receiver.py ─p
 - `insert_signal` 결과: `new`→**202** `{"accepted":true,"event_id":...}` / `duplicate`→**200** `{"accepted":true,"duplicate":true}` / `conflict`·`sequence_conflict`→**409** `{"error":"CONFLICT","code":...}`.
   **`event_id` 유일성은 mode 별**(`signals` PK = `(mode, event_id)`): TEST 키 보유자가 LIVE 의 event_id 를 선점할 수 없다.
 - 2xx 는 **접수 확인**일 뿐이며 실행 결과는 회신(execution report)으로만 전달.
-- 접수 거부 기록: **서명을 통과한 뒤의 거부**(400 SCHEMA/의미, 401 TIMESTAMP_MISMATCH, 409, 410)만 `store.log_ingress(code, event_id, body)` 로 남긴다(원본 본문은 저장하지 않고 sha256 만). **서명 전 거부**(400 BAD_JSON/BAD_MODE, 401, 413, 415, 503)는 DB 에 쓰지 않고 메모리 카운터(`/state` 의 `ingress_rejections`)로만 센다 — 무인증 요청 폭주가 디스크/DB 락을 소모하지 못하게. `ingress_log` 는 실행기가 7일/5만 행 기준으로 정리한다. 로그에 찍는 event_id 는 ID 패턴을 통과한 값만(로그 주입 방지).
+- 접수 거부 기록: **서명을 통과한 뒤의 거부**(400 SCHEMA/의미, 401 TIMESTAMP_MISMATCH, 409, 410)만 `store.log_ingress(code, event_id, body)` 로 남긴다(원본 본문은 저장하지 않고 sha256 만). 서명 통과 뒤의 `duplicate`(200) 도 `DUPLICATE` 행으로 남긴다(대시보드에서 재전송 추적용; 실행은 여전히 한 번). **서명 전 거부**(400 BAD_JSON/BAD_MODE, 401, 413, 415, 503)는 DB 에 쓰지 않고 메모리 카운터(`/state` 의 `ingress_rejections`)로만 센다 — 무인증 요청 폭주가 디스크/DB 락을 소모하지 못하게. `ingress_log` 는 실행기가 7일/5만 행 기준으로 정리한다. 로그에 찍는 event_id 는 ID 패턴을 통과한 값만(로그 주입 방지).
 - 응답 본문에 시크릿·내부 예외 원문을 넣지 않는다. 예상 못 한 검증 예외도 500 이 아니라 400 으로 닫는다. 5초 안에 응답(영속 접수 외의 작업은 하지 않음).
 - `GET /healthz` → 200 `{"ok":true,"halted":bool,"inconsistent":{"test":..,"live":..},"protection_missing":{"test":n,"live":n}}` (인증 없음, 내용 최소; `protection_missing` = 보호가격이 설정됐는데 보호주문이 빠진 open lot 수).
 - 관리(모두 `X-Admin-Token` 헤더 필요, `ADMIN_TOKEN` 미설정 시 404, **`ADMIN_TOKEN` 은 32바이트 이상**(config 검증), 같은 IP 의 실패 10회/60초 뒤에는 비교 없이 401): `GET /state`(최근 신호/회신/오픈 lot/거래소 포지션 요약/`protection_missing`/`ingress_rejections`), `POST /admin/halt`, `POST /admin/resume`, `POST /admin/reconcile?mode=live`. 배포에서는 Caddy 가 `/state`, `/admin/*` 를 `ADMIN_ALLOW_CIDR`(기본 서버 로컬만) 밖에서는 404 로 막는다.
 - 앱 팩토리: `create_app(settings, store, services) -> FastAPI` 로 테스트 가능해야 함(`services` 는 executor/reporter 핸들을 담은 간단한 객체; 수신 경로는 executor 를 직접 호출하지 않고 DB 에만 쓴다).
+  관리 동작 본체는 `app.state.admin_ops`(`halt(source)`, `resume(source)`, `reconcile(mode, account) -> (status, body)`) 로 노출되어 JSON 엔드포인트와 대시보드가 공유한다. `app.state.admin_throttle` 도 공유.
+
+## 2a. 운영 대시보드 (web.py)
+- `mount(app, settings, store, services, admin_throttle)` 를 `create_app` 마지막 줄에서 호출한다(함수 안 import, 순환 import 회피). stdlib + fastapi/starlette 만, 템플릿·JS·CDN 없음. `services.paths`(`env`/`config` 경로) 와 `services.started_ms` 는 `main.cmd_serve` 가 넣는다 — 없으면 쓰기 폼은 409 `ENV_PATH_UNKNOWN`, 읽기 페이지는 그대로.
+- 게이트 순서(모든 `/ui*`): `ADMIN_TOKEN` 미설정 → 404 `{"error":"NOT_FOUND"}` → 세션 쿠키 `lake_ui`(`sid.exp_ms.sig`, 키 = HMAC(ADMIN_TOKEN); GET 은 `/ui/login` 으로 303, POST 는 401) → POST 는 `_csrf`(세션 파생, 실패는 `admin_throttle.fail(ip)`) → 핸들러. 로그인 실패는 `/admin/*` 와 같은 IP 별 예산. 폼은 `application/x-www-form-urlencoded` ≤ 16KB.
+- 페이지: Overview(거래소 호출 없음) / Signals(+상세: 원본 페이로드, run, lot, 주문·체결, event_id 를 실은 회신, ingress 행) / Orders(`raw` 제외) / Reports(본문 길이만) / Ingress / Accounts(키 저장·연결 Check) / Secrets / Controls(HALT·재개·대사·live.enabled·재시작·최근 20건).
+- **핫스왑 금지 규칙**: 거래소 래퍼·`Executor.exchanges`·스냅샷 스트림·`Alerts` 토큰·`RedactingFormatter` 는 기동 시 고정이므로 프로세스 내 교체를 하지 않는다. 디스크의 `.env`/`config.json` 이 단일 진실(검증: `config.load(env_override=…)` + 거래소 생성자 드라이런 → `util.write_env_file`(원자적, `.env.bak`, 0600) → 재검증, 실패 시 복원), 적용은 `RestartGuard`(기동 60초 뒤, 60초 간격, 5분 3회; 이력은 meta `ui_restarts`) 의 SIGTERM → systemd 재시작뿐. 유일한 예외는 `settings.live_enabled = False`(즉시, 보수적 방향).
+- 값은 어디에도 싣지 않는다: `mask()`(앞 4자 + 길이), URL 은 호스트만, 거래소 예외는 코드/타입 이름만, 플래시·알림·감사는 키 이름만. 응답 헤더 `Cache-Control: no-store`, CSP `default-src 'none'`, `X-Frame-Options: DENY`.
 
 ## 3. 실행기 (executor.py)
 `Executor(settings, store, exchanges: dict[str, ExchangeBase|None], reporter, alerts)` — `exchanges["live"]` 는 BybitExchange 또는 None, `exchanges["test"]` 는 PaperExchange(simulate_fills 일 때) 또는 None.
@@ -143,6 +151,8 @@ class Reporter:
 - `test_reporter.py`: 본문이 계약 스키마와 일치(`jsonschema` 없이 필드/타입 직접 검사), sequence 연속·재시작 유지, observed 단조, 체결 외 null 규칙, 전송 상태 전이(가짜 client 주입: 202/200/409/500→재시도/타임아웃).
 - `test_executor_resilience.py`(결함 주입 PaperExchange): 취소 vs 체결 경합, 트리거 이미 지난 SL/TP 즉시 실행, 체결 뒤 보호주문 실패(`PROTECTION_FAILED`) + reconcile 자가 복구, 조건부 타임아웃 채택·고아 스탑 정리, 실행 시점 `EXPIRED`, protection_update 실패 후 같은 revision 재시도, 불명 주문 늦은 확인/`absent`, 취소된 보호주문 재생성, 보호주문 단계 오류가 스냅샷을 막지 않음, `PartiallyFilledCanceled`, lot 종료 취소 실패, `OPPOSING_LEG`, auto 이벤트 ID 인스턴스, 모의 시세 추종.
 - `test_receiver.py` 추가: 서명 전 거부는 DB 미기록(카운터), mode 별 event_id, chunked 413, Content-Type 누락 415, 깊은 JSON 400, 문자열 ts 401, event_id 로그 주입 차단, 관리 토큰 무차별 대입 제한, 짧은 `ADMIN_TOKEN` 설정 오류.
+- `test_web.py`(대시보드): ADMIN_TOKEN 미설정 404, 로그인 페이지 무값, 잘못된 토큰 401 + `/admin/*` 와 공유되는 IP 예산, 쿠키 속성(`HttpOnly/SameSite=Strict/Path=/ui/Max-Age`, https 면 `Secure`), 쿼리/헤더 토큰 무시, 쿠키 변조·만료·다른 키 거부, 비로그인 POST 401, CSRF 403, 폼 415/413, HALT/재개, 대사(400/429), 개요·신호 목록/상세·필터/페이지·주문(`raw` 비노출)·회신(본문 비노출), DUPLICATE ingress 행, 시크릿 마스킹, 키 저장(`.env` 갱신·`.bak`·0600·pending 배너·알림에 이름만), 잘못된 후보 거부(파일 불변), BAD_KEY, 빈 칸 유지, ADMIN_TOKEN 회전 확인어, live.enabled 토글(끄기 즉시/켜기 재시작/검증 실패 500), RestartGuard(kill 기록기), 계정 Check(디스크 키·10초 제한·오류 코드만), 로그아웃 revoke, paths 없음 409, 전 페이지 시크릿 유출 전수 검사.
+- `test_util_env.py`: `.env` 쓰기 왕복(주석·순서 보존, 제자리 교체, 중복 제거, 주석 템플릿 활성화, 추가), 따옴표 규칙, 원자적 교체(`.bak`, 임시 파일 정리, POSIX 0600), `set_json_value`(중첩 생성, 불리언 유지, 검증 실패 시 원본 유지).
 - 전부 네트워크 없이 통과해야 하며 `python -m pytest -q` 로 실행.
 
 ## 10. 금지/주의
@@ -150,3 +160,4 @@ class Reporter:
 - 원본 본문·시크릿·거래소 오류 원문을 회신/응답/INFO 로그에 넣지 않는다.
 - `close` 류 신호를 **심볼 전량 청산으로 확대하지 않는다**(lot 잔량만).
 - 과거/재전송 신호를 새 매매로 처리하지 않는다(event_id 영속, sequence 검증).
+- 대시보드(`/ui`)는 시크릿 값을 절대 렌더링하지 않는다(마스킹만). 새 값의 적용 경로는 재시작뿐이며, 대시보드는 신호를 만들거나 주문을 내지 않는다.

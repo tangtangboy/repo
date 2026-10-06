@@ -739,6 +739,85 @@ class Store:
                        (mode, account, limit))
 
 
+    # ------------------------------------------------------------------ 운영 조회 (web.py 대시보드 전용, 읽기 전용)
+    _SIGNAL_COLS = ("event_id,mode,received_at_ms,position_id,event_sequence,action,strategy,leg,position_idx,"
+                    "qty_btc,status,reason_code,processed_at_ms,note")
+    _ORDER_COLS = ("order_link_id,account,mode,event_id,position_id,purpose,side,qty,reduce_only,order_id,status,"
+                   "trigger_price,created_at_ms,updated_at_ms")
+    _REPORT_COLS = ("report_id,mode,account,sequence,kind,created_at_ms,sent_at_ms,http_status,attempts,state,note,"
+                    "length(body) AS body_len")
+
+    @staticmethod
+    def _where(filters: list[tuple[str, object]]) -> tuple[str, list]:
+        """[(column, value)] → (' WHERE col=? AND …', params). value 가 None 인 항목은 건너뛴다. 값은 절대 문자열에 섞지 않는다."""
+        parts = [f"{col}=?" for col, v in filters if v is not None]
+        params = [v for _, v in filters if v is not None]
+        return (" WHERE " + " AND ".join(parts)) if parts else "", params
+
+    def recent_ingress(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        return self._q("SELECT id,received_at_ms,code,event_id,body_sha256,note FROM ingress_log "
+                       "ORDER BY id DESC LIMIT ? OFFSET ?", (int(limit), int(offset)))
+
+    def ingress_for_event(self, event_id: str, limit: int = 20) -> list[dict]:
+        return self._q("SELECT id,received_at_ms,code,event_id,body_sha256,note FROM ingress_log WHERE event_id=? "
+                       "ORDER BY id DESC LIMIT ?", (event_id, int(limit)))
+
+    def list_signals(self, mode: str | None = None, status: str | None = None, limit: int = 50,
+                     offset: int = 0) -> list[dict]:
+        where, params = self._where([("mode", mode), ("status", status)])
+        return self._q(f"SELECT {self._SIGNAL_COLS} FROM signals{where} ORDER BY received_at_ms DESC, rowid DESC "
+                       "LIMIT ? OFFSET ?", (*params, int(limit), int(offset)))
+
+    def signal_counts(self) -> list[dict]:
+        return self._q("SELECT mode,status,COUNT(*) AS n FROM signals GROUP BY mode,status ORDER BY mode,status")
+
+    def list_orders(self, mode: str | None = None, account: str | None = None, status: str | None = None,
+                    limit: int = 50, offset: int = 0) -> list[dict]:
+        where, params = self._where([("mode", mode), ("account", account), ("status", status)])
+        return self._q(f"SELECT {self._ORDER_COLS} FROM orders{where} ORDER BY created_at_ms DESC LIMIT ? OFFSET ?",
+                       (*params, int(limit), int(offset)))
+
+    def orders_for_event(self, mode: str, event_id: str) -> list[dict]:
+        return self._q(f"SELECT {self._ORDER_COLS} FROM orders WHERE mode=? AND event_id=? ORDER BY created_at_ms",
+                       (mode, event_id))
+
+    def fills_for_event(self, mode: str, event_id: str) -> list[dict]:
+        return self._q("SELECT * FROM fills WHERE mode=? AND event_id=? ORDER BY exec_time_ms", (mode, event_id))
+
+    def list_reports(self, mode: str | None = None, account: str | None = None, state: str | None = None,
+                     limit: int = 50, offset: int = 0) -> list[dict]:
+        where, params = self._where([("mode", mode), ("account", account), ("state", state)])
+        return self._q(f"SELECT {self._REPORT_COLS} FROM reports{where} ORDER BY created_at_ms DESC, sequence DESC "
+                       "LIMIT ? OFFSET ?", (*params, int(limit), int(offset)))
+
+    def reports_for_event(self, mode: str, event_id: str, limit: int = 50) -> list[dict]:
+        """본문에 그 event_id 가 실린 회신(execution 류). needle 은 canonical JSON 의 바이트열 그대로(LIKE 와일드카드 없음).
+        반환 행에는 body 대신 body_len 과 본문에서 읽은 execution_status 만 싣는다."""
+        needle = ('"event_id":"%s"' % event_id).encode("utf-8")
+        rows = self._q("SELECT report_id,mode,account,sequence,kind,created_at_ms,sent_at_ms,http_status,attempts,state,"
+                       "note,body FROM reports WHERE mode=? AND instr(body, ?) > 0 ORDER BY sequence LIMIT ?",
+                       (mode, needle, int(limit)))
+        out = []
+        for r in rows:
+            body = r.pop("body", None)
+            if isinstance(body, memoryview):
+                body = body.tobytes()
+            r["body_len"] = len(body or b"")
+            r["execution_status"] = None
+            try:
+                parsed = json.loads(bytes(body).decode("utf-8")) if body else None
+                ex = (parsed or {}).get("execution") if isinstance(parsed, dict) else None
+                if isinstance(ex, dict) and ex.get("event_id") == event_id:
+                    r["execution_status"] = ex.get("status")
+            except (ValueError, TypeError, UnicodeDecodeError):
+                pass
+            out.append(r)
+        return out
+
+    def report_counts(self) -> list[dict]:
+        return self._q("SELECT mode,state,COUNT(*) AS n FROM reports GROUP BY mode,state ORDER BY mode,state")
+
+
 class _Tx:
     def __init__(self, store: Store):
         self.s = store

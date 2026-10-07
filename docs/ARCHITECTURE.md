@@ -178,3 +178,30 @@ class Reporter:
 - 재시작/재연결 뒤 순서: `ensure_account_setup` → `recover_processing`(processing 신호는 재실행 없이 거래소 주문 조회로 마무리) → accepted 신호 FIFO(만료 정책 적용)
   → 스냅샷 루프의 `reconcile` 이 lot 과 거래소 포지션을 대조, pending 회신은 같은 바이트로 이어서 전송. 원장이 Postgres 면 **다른 서버** 에서 같은 절차로 이어받을 수 있다.
 - `check`: `DATABASE_URL` 이 있으면 실제 접속해 `ledger : postgres host:port/db schema=… round-trip N ms` 를 출력한다 (500ms 초과 경고). 대시보드 Overview `ledger` 행도 같은 정보.
+
+## 12. 계정 트레이드 히스토리 (history.py) 와 성과 (metrics.py)
+
+- **왜 따로**: 신호 로그(§11 의 signal_log) 는 "받은 신호", 여기는 "각 계정에서 실제로 체결된 것과 자산". 사용자가 따라
+  들어간 결과는 거래소 히스토리 API 가 진실이므로 우리 체결 기록을 스냅샷하지 않고 거래소에서 받아 적재한다.
+- **테이블** (`store.py`, `(mode, account)` 단위, PK 로 멱등): `account_executions(exec_id)`, `account_closed_pnl(pnl_id)`,
+  `account_cashflow(flow_id; type=deposit|withdraw|funding)`, `account_equity(ts_ms, total_equity, wallet, upl, available)`,
+  `sync_state(kind; last_ts_ms, cursor)`. 조회는 시간 범위 인덱스(`ix_acct_*_time`).
+- **소스 프로토콜**: `fetch_executions / fetch_closed_pnl / fetch_cashflows(since_ms, until_ms, cursor) -> (rows, next_cursor)`,
+  `fetch_equity() -> {total_equity, wallet_balance, unrealised_pnl, available}`, `max_window_ms`(거래소 창 제한).
+  `BybitHistory`(pybit `get_executions / get_closed_pnl / get_transaction_log / get_wallet_balance`, 7일 창, 커서 페이지),
+  `PaperHistory`(PaperExchange 의 체결·`closed_pnls`·`equity_snapshot()`; Paper 는 감소 체결마다 평균단가 기준 실현손익을 기록한다).
+  `build_sources(settings, exchanges)` 가 serve 의 `{mode: {account: exchange}}` 에서 어댑터를 만든다 (OKX/Toobit 은 아직 없음 → 로그 후 건너뜀).
+- **HistorySync**: 전용 DB 연결(`store_factory`). `sync_account(mode, account, src, backfill_since_ms=None)` 는 종류마다
+  `sync_state.last_ts_ms − OVERLAP(5분)` 부터 지금까지(첫 동기화는 `history.backfill_days`) 창을 `max_window_ms` 로 잘라
+  커서가 끝날 때까지 받고 `INSERT OR IGNORE` 한다. 자산 스냅샷은 `history.equity_interval_s` 마다(백필 땐 강제). `run_forever`
+  는 기동 5초 뒤부터 `history.sync_interval_s` 간격, 계정별 예외 격리 + 알림 5분 1회 + `stats`(대시보드 Overview/Performance).
+  `backfill(mode, account, since_ms, until_ms)` / `backfill_async`(대시보드 버튼, 데몬 스레드).
+- **metrics.account_performance(store, settings, mode, account, since, until)**: seed(설정 `seed_usdt` 또는 첫 스냅샷) ·
+  equity_now · net_deposits · pnl_total · roi_vs_seed · roi_vs_net_deposits · fees/funding · `closed`(승률·profit factor…) ·
+  `equity`(고점·최대낙폭) · `ledger`(우리 fills 를 orders.reduce_only / lots.leg·strategy 로 조인해 평균단가 실현손익을
+  전략별 귀속; 열린 포지션 포함) · `daily`(UTC 일별) · `sync`. `performance_all` 은 계정 목록 전체.
+- **표면**: CLI `backfill`, `performance [--json]`; 대시보드 `/ui/performance`(필터 mode/account/since/until, Backfill now),
+  `/ui/api/performance.json`(같은 JSON, 로그인 세션), Overview `trade history sync` 행. 설정 `history.{enabled,
+  sync_interval_s, equity_interval_s, backfill_days}`, `accounts[].seed_usdt`.
+- **주문 경로와의 분리**: 수신기/실행기는 이 모듈을 호출하지 않는다. 거래소 히스토리 호출 실패·DB 실패는 다음 주기에
+  재시도될 뿐 매매에 영향이 없다.

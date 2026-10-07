@@ -684,7 +684,7 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
 
     # ------------------------------------------------------------------ 페이지 틀
     NAV = [("/ui", "Overview"), ("/ui/signals", "Signals"), ("/ui/orders", "Orders"), ("/ui/reports", "Reports"),
-           ("/ui/ingress", "Ingress"), ("/ui/signal-log", "Signal log"), ("/ui/accounts", "Accounts"),
+           ("/ui/ingress", "Ingress"), ("/ui/signal-log", "Signal log"), ("/ui/performance", "Performance"), ("/ui/accounts", "Accounts"),
            ("/ui/secrets", "Secrets"), ("/ui/controls", "Controls")]
 
     def _head(title: str, refresh: int | None = None) -> str:
@@ -861,6 +861,21 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
         rec = int(getattr(store, "reconnects", 0) or 0)
         return _Raw(f"{_status(state)} {_esc(text)}{_esc(rtt)}" + (f" reconnects={rec}" if rec else ""))
 
+    def _history_summary() -> Any:
+        """history.py 동기화 상태: 계정별 마지막 동기화 시각 / 누적 적재 행 / 오류 (Performance 페이지 링크)."""
+        hist = rcv._svc(services, "history")
+        link = f' · <a href="{UI_PREFIX}/performance">Performance</a>'
+        if hist is None:
+            return _Raw('<span class="muted">disabled (history.enabled=false)</span>' + link)
+        stats = hist.snapshot() if hasattr(hist, "snapshot") else {}
+        if not stats:
+            return _Raw(f"{_status('ok')} running, nothing synced yet{link}")
+        state = "fail" if any(v.get("errors") for v in stats.values()) else "ok"
+        parts = [f"{k} {_fmt_ms(v.get('last_sync_ms')) or 'never'} +{sum(v['inserted'].values())}"
+                 + (f" errors={v['errors']} ({v.get('last_error', '')})" if v.get("errors") else "")
+                 for k, v in sorted(stats.items())]
+        return _Raw(f"{_status(state)} {_esc(' · '.join(parts))}{link}")
+
     @app.get(UI_PREFIX)
     def ui_overview(request: Request):
         g = _gate(request)
@@ -898,6 +913,7 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
             ("process started", f"{_fmt_ms(started_ms)} (uptime {_fmt_uptime(now_ms() - started_ms)})"),
             ("pending restart", (",".join(pend["keys"]) + " — restart required") if pend else "no"),
             ("ledger", _ledger_summary()),
+            ("trade history sync", _history_summary()),
             ("expired actions still executed", ", ".join(getattr(settings, "expired_actions_execute", None) or []) or "none"),
             ("editing", (f"env={paths.env} config={paths.config}" if paths
                          else "editing disabled (serve was not started with known --env/--config)")),
@@ -1201,6 +1217,152 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
                             headers={"Content-Disposition": f'attachment; filename="{name}"'})
             return _with_headers(resp)
         return _run(_impl, session)
+
+    # ------------------------------------------------------------------ 성과: 계정 트레이드 히스토리 + 시드 대비 PnL/ROI (metrics.py)
+    def _perf_filters(request: Request) -> tuple[str, str | None, int | None, int | None]:
+        names = tuple(a.name for a in settings.accounts)
+        mode = _filter(request, "mode", tuple(MODES)) or ("live" if getattr(settings, "live_enabled", False) else "test")
+        account = _filter(request, "account", names) if names else None
+        _, since, until = _signal_log_filters(request)
+        return mode, account, since, until
+
+    def _perf_rows(mode: str, account: str | None, since: int | None, until: int | None) -> list[dict]:
+        from .metrics import performance_all
+        return performance_all(store, settings, mode, since, until, accounts=[account] if account else None)
+
+    def _pct(v: Any) -> str:
+        return "-" if v is None else f"{float(v) * 100:+.2f}%"
+
+    def _num(v: Any, nd: int = 4) -> str:
+        return "-" if v is None else f"{float(v):,.{nd}f}"
+
+    def _perf_card(r: dict, session: Session) -> str:
+        c, eq, led = r["closed"], r["equity"], r["ledger"]
+        sync = r.get("sync") or {}
+        head = _kv([
+            ("seed (USDT)", f"{_num(r['seed'])} ({r.get('seed_source') or 'no equity snapshot yet'})"),
+            ("equity now", f"{_num(r['equity_now'])} @ {_fmt_ms(r.get('equity_at_ms'))}" if r.get("equity_now") is not None else "-"),
+            ("net deposits", f"{_num(r['net_deposits'])} (in {_num(r['deposits'])} / out {_num(r['withdrawals'])})"),
+            ("PnL total (equity - net deposits)", _Raw(f"<b>{_esc(_num(r['pnl_total']))}</b>")),
+            ("ROI vs seed", _Raw(f"<b>{_esc(_pct(r['roi_vs_seed']))}</b>")),
+            ("ROI vs net deposits", _pct(r["roi_vs_net_deposits"])),
+            ("unrealised pnl", _num(r.get("unrealised_pnl"))),
+            ("closed pnl (exchange)", f"{_num(c['realized_closed_pnl'])} over {c['trades']} trades"),
+            ("win / loss / win rate", f"{c['wins']} / {c['losses']} / {_pct(c['win_rate'])}"),
+            ("profit factor", _num(c["profit_factor"], 2)),
+            ("avg win / avg loss", f"{_num(c['avg_win'])} / {_num(c['avg_loss'])}"),
+            ("largest win / loss", f"{_num(c['largest_win'])} / {_num(c['largest_loss'])}"),
+            ("fees / funding", f"{_num(r['fees'])} / {_num(r['funding'])}"),
+            ("executions", r["executions"]),
+            ("equity snapshots", f"{eq['points']} (peak {_num(eq.get('peak'))}, max drawdown {_num(eq.get('max_drawdown'))} = {_pct(eq.get('max_drawdown_pct'))})"),
+            ("ledger realized (our fills, avg-cost)", f"{_num(led['realized'])} · closed positions {led['positions_closed']} · open {len(led['open_positions'])} · fills {led['fills']}"),
+        ])
+        strat = _table(["strategy", "realized pnl"], [[k, _num(v)] for k, v in sorted(led["by_strategy"].items())],
+                       empty="(no closed positions in our ledger)")
+        openp = _table(["position_id", "strategy", "leg", "qty", "avg entry"],
+                       [[o["position_id"], o["strategy"], o["leg"], o["qty"], _num(o["avg_entry"], 2)] for o in led["open_positions"]],
+                       empty="(no open positions in our ledger)")
+        syncs = _table(["kind", "last record", "synced at"],
+                       [[k, _fmt_ms(v["last_ts_ms"]) if v["last_ts_ms"] else "-", _fmt_ms(v["updated_at_ms"])] for k, v in sorted(sync.items())],
+                       empty="(never synced — serve syncs every history.sync_interval_s; or Backfill below)")
+        daily = r["daily"][-31:]
+        dtable = _table(["date (UTC)", "closed pnl", "trades", "fees", "funding", "deposits", "withdrawals", "executions", "equity close"],
+                        [[d["date"], _num(d["closed_pnl"]), d["trades"], _num(d["fees"]), _num(d["funding"]), _num(d["deposits"]),
+                          _num(d["withdrawals"]), d["executions"], _num(d["equity_close"], 2)] for d in reversed(daily)],
+                        empty="(no daily data)")
+        default_since = datetime.fromtimestamp((now_ms() - 30 * 86400 * 1000) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        bf = _form_post(f"{UI_PREFIX}/performance/backfill", session.csrf,
+                        f'<input type="hidden" name="mode" value="{_esc(r["mode"])}">'
+                        f'<input type="hidden" name="account" value="{_esc(r["account"])}">'
+                        f'<label>since (UTC) <input type="text" name="since" value="{default_since}" autocomplete="off"></label>'
+                        '<p class="muted">re-reads executions / closed pnl / cashflow from the exchange since this date and inserts '
+                        'what is missing (idempotent). Runs in the background; refresh this page.</p>',
+                        "Backfill now")
+        return (f'<div class="card"><h2>{_esc(r["mode"])}/{_esc(r["account"])} '
+                f'<span class="muted">{_esc(r.get("exchange") or "")} {_esc(r.get("symbol") or "")} x{_esc(r.get("leverage"))}</span></h2>'
+                f"{head}<h3>Realized by strategy (our ledger)</h3>{strat}<h3>Open positions (our ledger)</h3>{openp}"
+                f"<h3>Sync state</h3>{syncs}<h3>Daily (last 31 days)</h3>{dtable}{bf}</div>")
+
+    @app.get(f"{UI_PREFIX}/performance")
+    def ui_performance(request: Request):
+        g = _gate(request)
+        if isinstance(g, Response):
+            return g
+        session = g
+
+        def _impl() -> Response:
+            mode, account, since, until = _perf_filters(request)
+            rows = _perf_rows(mode, account, since, until)
+            hist = rcv._svc(services, "history")
+            hstats = hist.snapshot() if hist is not None and hasattr(hist, "snapshot") else {}
+            q = {"mode": mode, "account": account, "since": _q(request, "since"), "until": _q(request, "until")}
+            qs = urllib.parse.urlencode({k: v for k, v in q.items() if v})
+            filters = ("<form method=\"get\" class=\"filters\">"
+                       "<label>mode " + _select("mode", [(m, m) for m in MODES]) + "</label>"
+                       "<label>account " + _select("account", [(a.name, a.name) for a in settings.accounts], blank="(all)") + "</label>"
+                       '<label>since <input type="text" name="since" placeholder="YYYY-MM-DD" autocomplete="off"></label>'
+                       '<label>until <input type="text" name="until" placeholder="YYYY-MM-DD" autocomplete="off"></label>'
+                       '<button type="submit">Filter</button></form>')
+            status = ("history sync: " + ("disabled (history.enabled=false)" if hist is None else
+                      (" · ".join(f"{k}: last {_fmt_ms(v.get('last_sync_ms')) or 'never'} +{sum(v['inserted'].values())} rows"
+                                  f"{' errors=' + str(v['errors']) + ' (' + v['last_error'] + ')' if v.get('errors') else ''}"
+                                  for k, v in sorted(hstats.items())) or "running, nothing synced yet")))
+            body = ("<h2>Account performance (seed vs equity, exchange trade history)</h2>"
+                    f'<p class="muted">{_esc(status)}</p>'
+                    f'<p><a href="{UI_PREFIX}/api/performance.json?{_esc(qs)}">JSON</a> (same numbers, for a dashboard) · '
+                    "CLI: <code>python -m lake_executor performance --mode live</code> · "
+                    "<code>python -m lake_executor backfill --mode live --since YYYY-MM-DD</code></p>"
+                    + filters + ("".join(_perf_card(r, session) for r in rows) or '<p class="muted">no accounts configured</p>'))
+            return _html(200, _page("Performance", body, active=f"{UI_PREFIX}/performance", session=session,
+                                    flash=_flash_of(request, session)))
+        return _run(_impl, session)
+
+    @app.get(f"{UI_PREFIX}/api/performance.json")
+    def ui_performance_json(request: Request):
+        g = _gate(request)
+        if isinstance(g, Response):
+            return g
+        session = g
+
+        def _impl() -> Response:
+            mode, account, since, until = _perf_filters(request)
+            hist = rcv._svc(services, "history")
+            return _json(200, {"mode": mode, "since_ms": since, "until_ms": until, "generated_at_ms": now_ms(),
+                               "accounts": _perf_rows(mode, account, since, until),
+                               "sync": hist.snapshot() if hist is not None and hasattr(hist, "snapshot") else None})
+        return _run(_impl, session)
+
+    def _do_backfill(form: dict[str, str], session: Session, ip: str) -> Response:
+        from .main import parse_when
+        mode = form.get("mode", "")
+        account = form.get("account", "")
+        if mode not in MODES:
+            raise UiError(400, "BAD_REQUEST", "mode must be test or live")
+        if account not in {a.name for a in settings.accounts}:
+            raise UiError(404, "NOT_FOUND", f"unknown account {account!r}")
+        try:
+            since = parse_when(form.get("since", ""))
+        except ValueError:
+            raise UiError(400, "BAD_REQUEST", "since: use YYYY-MM-DD, YYYY-MM-DDTHH:MM or Unix ms") from None
+        if since is None:
+            raise UiError(400, "BAD_REQUEST", "since is required")
+        hist = rcv._svc(services, "history")
+        if hist is None:
+            raise UiError(409, "HISTORY_DISABLED", "history sync is disabled (history.enabled=false)")
+        if account not in (hist.sources.get(mode) or {}):
+            raise UiError(409, "NO_SOURCE", f"no history source for {mode}/{account} (live needs real keys; test needs simulate_fills)")
+        hist.backfill_async(mode, account, since)
+        _audit(ip, f"backfill {mode}/{account}", f"since={since}", alert=False)
+        return _redirect(f"{UI_PREFIX}/performance?mode={urllib.parse.quote(mode)}&account={urllib.parse.quote(account)}",
+                         session=session, flash=f"backfill {mode}/{account} started (since {_fmt_ms(since)})")
+
+    @app.post(f"{UI_PREFIX}/performance/backfill")
+    async def ui_performance_backfill(request: Request):
+        pre = await _post_prelude(request)
+        if isinstance(pre, Response):
+            return pre
+        form, session, ip = pre
+        return await run_in_threadpool(_run, lambda: _do_backfill(form, session, ip), session)
 
     # ------------------------------------------------------------------ .env 저장 공통
     def _file_env() -> dict[str, str]:

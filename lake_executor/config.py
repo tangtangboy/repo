@@ -72,6 +72,7 @@ class AccountSettings:
     report_secret: dict = field(default_factory=dict)   # mode -> secret
 
     category: str = "linear"              # Bybit v5 category (다른 거래소는 무시)
+    seed_usdt: float | None = None        # 성과(ROI) 기준 시드. 없으면 첫 자산 스냅샷을 시드로 본다 (metrics.py)
 
     # ---- 파생 ----
     @property
@@ -139,6 +140,12 @@ class Settings:
 
     routing: str = "fanout"               # fanout | by_exchange
     accounts: list = field(default_factory=list)   # list[AccountSettings]
+
+    # 계정 트레이드 히스토리 적재 (history.py): 증분 동기화 주기, 자산 스냅샷 주기, 첫 동기화 때 거슬러 올라갈 일수
+    history_enabled: bool = True
+    history_sync_interval_s: int = 60
+    history_equity_interval_s: int = 300
+    history_backfill_days: int = 30
 
     db_schema: str = "lake_executor"      # Postgres 원장 스키마 (DATABASE_URL 이 있을 때만)
     # 만료(expires_at_ms 경과) 뒤 도착/처리되는 신호 중 그래도 실행할 action. 진입류(entry/add) 는 절대 넣지 않는 것을 권장:
@@ -275,7 +282,10 @@ def _account_from_cfg(s: Settings, raw: dict, env: dict, sec: Secrets) -> Accoun
         qty_multiplier=_cast("qty_multiplier", float, 1.0),
         report=_cast("report", bool, True),
         category=str(raw.get("category", s.category)),
+        seed_usdt=(_cast("seed_usdt", float, 0.0) if raw.get("seed_usdt") not in (None, "") else None),
     )
+    if a.seed_usdt is not None and a.seed_usdt <= 0:
+        raise ConfigError(f"account {name}: seed_usdt must be > 0 (or omitted)")
     _fill_account_env(a, env, sec)
     return a
 
@@ -330,6 +340,12 @@ def load(config_path: str = "config.json", env_path: str = ".env", env_override:
     s.log_file = str(_get(cfg, "log_file", s.log_file) or "")
     s.routing = str(_get(cfg, "routing", s.routing))
     s.db_schema = str(_get(cfg, "database.schema", s.db_schema) or "lake_executor")
+    s.history_enabled = bool(_get(cfg, "history.enabled", s.history_enabled))
+    s.history_sync_interval_s = int(_get(cfg, "history.sync_interval_s", s.history_sync_interval_s))
+    s.history_equity_interval_s = int(_get(cfg, "history.equity_interval_s", s.history_equity_interval_s))
+    s.history_backfill_days = int(_get(cfg, "history.backfill_days", s.history_backfill_days))
+    if s.history_sync_interval_s < 10 or s.history_equity_interval_s < 10 or s.history_backfill_days < 1:
+        raise ConfigError("history.sync_interval_s/equity_interval_s must be >= 10 and backfill_days >= 1")
     eae = _get(cfg, "guards.expired_actions_execute", None)
     if eae is not None:
         if not isinstance(eae, list) or not all(isinstance(x, str) for x in eae):

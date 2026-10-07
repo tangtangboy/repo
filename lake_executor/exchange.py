@@ -529,6 +529,11 @@ class PaperExchange(ExchangeBase):
         self._order_seq = 0
         self._exec_seq = 0
         self._prot_seq = 0
+        # 성과 추적 (test 모드 성과 지표용): 시드 + 실현손익(감소 체결마다 평균단가 기준) + 미실현
+        self.seed_usdt = float(getattr(self.account, "seed_usdt", None) or 10000.0)
+        self.realized_pnl = 0.0
+        self.closed_pnls: list[dict] = []
+        self._pnl_seq = 0
         self.account_setup: dict | None = None
         self.position_protections: dict[int, dict] = {}   # position_idx -> {"stop_loss","take_profit"}
         self.protection_events: list[dict] = []           # 포지션 단위 보호 발동 기록
@@ -546,6 +551,9 @@ class PaperExchange(ExchangeBase):
             self._order_seq = 0
             self._exec_seq = 0
             self._prot_seq = 0
+            self.realized_pnl = 0.0
+            self.closed_pnls = []
+            self._pnl_seq = 0
             self.position_protections.clear()
             self.protection_events.clear()
 
@@ -813,6 +821,7 @@ class PaperExchange(ExchangeBase):
             return
         # 반대 방향: 감소. 초과분은 one_way(idx 0) 에서만 반전, 헤지 idx 는 0 에서 멈춤
         remain = qty - pos["size"]
+        self._record_closed(idx, pos, min(qty, pos["size"]), price, t)
         if remain <= step / 2:
             new_size = floor_step(pos["size"] - qty + step / 4, step)
             if new_size <= step / 2:
@@ -826,6 +835,35 @@ class PaperExchange(ExchangeBase):
                                     "avg_price": price, "updated_time_ms": t}
         else:
             del self._positions[idx]
+
+    def _record_closed(self, idx: int, pos: dict, closed_qty: float, price: float, t: int) -> None:
+        """감소 체결의 실현손익 (평균단가 기준). history.PaperHistory 가 청산손익 레코드로 읽는다."""
+        if closed_qty <= 0:
+            return
+        direction = 1.0 if pos["side"] == "Buy" else -1.0
+        pnl = (price - pos["avg_price"]) * closed_qty * direction
+        self.realized_pnl += pnl
+        self._pnl_seq += 1
+        self.closed_pnls.append({
+            "pnl_id": f"ppnl-{self._id_tag}{self._pnl_seq}", "order_id": None, "side": pos["side"], "qty": closed_qty,
+            "avg_entry_price": pos["avg_price"], "avg_exit_price": price, "closed_pnl": pnl,
+            "leverage": getattr(self.account, "leverage", None), "position_idx": idx, "created_at_ms": t,
+        })
+
+    def unrealised_pnl(self) -> float:
+        p = self._mark if self._mark is not None else self._price
+        total = 0.0
+        for pos in self._positions.values():
+            direction = 1.0 if pos["side"] == "Buy" else -1.0
+            total += (p - pos["avg_price"]) * pos["size"] * direction
+        return total
+
+    def equity_snapshot(self) -> dict:
+        """시드 + 실현 + 미실현 (history.PaperHistory.fetch_equity)."""
+        with self._lock:
+            wallet = self.seed_usdt + self.realized_pnl
+            upl = self.unrealised_pnl()
+            return {"total_equity": wallet + upl, "wallet_balance": wallet, "unrealised_pnl": upl, "available": wallet}
 
     def _trigger_conditionals(self, p: float) -> list[dict]:
         fired: list[dict] = []

@@ -229,6 +229,42 @@ python -m lake_executor export --format jsonl                                   
 | `fill_qty`, `fill_avg_price`, `fill_count`, `first_fill_ms`, `last_fill_ms`, `fill_latency_ms` | 우리 체결 집계 (수신 → 첫 체결까지) |
 | `account_exchange`, `account_leverage`, `account_margin_mode`, `account_position_mode`, `account_qty_multiplier`, `account_live_possible` | 그 시점의 계정 사이징 문맥 |
 
+## 계정 트레이드 히스토리 적재와 성과 (시드 대비 PnL / ROI)
+
+각 계정(사용자) 의 **거래소 체결·청산손익·입출금·자산** 을 거래소 히스토리 API 로 받아 장부(DB) 에 쌓고(`history.py`),
+그 위에서 시드 대비 수익을 계산한다(`metrics.py`). 신호 로그가 "무엇을 받았나" 라면 이것은 "각 계정에서 실제로
+무엇이 체결되고 자산이 어떻게 변했나" 다. 나중 대시보드는 `/ui/api/performance.json` 을 그대로 읽으면 된다.
+
+- **테이블**: `account_executions`(체결), `account_closed_pnl`(청산손익), `account_cashflow`(입금/출금/펀딩),
+  `account_equity`(자산 스냅샷), `sync_state`(계정·종류별 마지막 시각). 전부 `(mode, account)` 단위이고 PK 로 중복을
+  거르므로 **백필을 몇 번 돌려도 같은 행은 한 번만** 들어간다.
+- **동기화**: `serve` 가 `history.sync_interval_s`(기본 60초) 마다 증분으로 받는다(마지막 시각 − 5분부터 다시 읽어
+  거래소의 지연 반영 레코드를 놓치지 않는다). 자산 스냅샷은 `history.equity_interval_s`(기본 300초) 마다 한 줄.
+  첫 동기화는 `history.backfill_days`(기본 30일) 만큼 거슬러 간다. 거래소 창 제한(Bybit 7일) 은 자동으로 잘라 돈다.
+  주문 경로와 완전히 분리(전용 DB 연결, 실패는 로그 + 알림 5분 1회, 다음 주기에 재시도).
+- **소스**: Bybit v5(`execution/list` · `position/closed-pnl` · `account/wallet-balance` · `account/transaction-log`).
+  test 모드는 PaperExchange 가 같은 형식으로 낸다(시드 `accounts[].seed_usdt`, 기본 10000). OKX/Toobit 은 아직 없음(건너뜀).
+- **백필**: `python -m lake_executor backfill --mode live --account bybit --since 2026-06-01 [--until …]`
+  또는 대시보드 Performance → **Backfill now**(백그라운드).
+- **성과**: `python -m lake_executor performance --mode live [--account …] [--since …] [--json]`,
+  대시보드 `/ui/performance`, JSON `/ui/api/performance.json?mode=live&account=bybit&since=…`(로그인 세션 필요).
+  Overview 의 `trade history sync` 행에 계정별 마지막 동기화/누적 행/오류가 보인다.
+
+지표 정의 (`metrics.py` 상단과 같다):
+
+| 키 | 뜻 |
+|---|---|
+| `seed` | 시드. `accounts[].seed_usdt` 가 있으면 그 값, 없으면 그 계정의 **첫 자산 스냅샷** (`seed_source` 로 구분) |
+| `equity_now` | 최신 자산 스냅샷 (미실현 포함) |
+| `net_deposits` | seed + 입금 − 출금 |
+| `pnl_total` | equity_now − net_deposits (실현+미실현+수수료+펀딩이 전부 반영된 실제 손익) |
+| `roi_vs_seed` / `roi_vs_net_deposits` | (equity_now − seed)/seed, pnl_total/net_deposits — 입출금이 있으면 후자가 맞다 |
+| `closed.*` | 거래소 청산손익 기준 거래수·승/패·승률·profit factor·평균/최대 손익·거래량 |
+| `fees` / `funding` | 체결 수수료 합 / 펀딩 정산 합 |
+| `equity.max_drawdown(_pct)` | 자산 스냅샷 시계열의 최대 낙폭 |
+| `ledger.*` | 우리 체결(fills) 을 평균단가 방식으로 전략/포지션별 실현손익에 귀속 (거래소 집계와 별개의 교차검증) |
+| `daily[]` | UTC 일별 청산손익·거래수·수수료·펀딩·입출금·종가 자산 |
+
 ## 운영 대시보드 (/ui)
 
 서버에 올린 뒤 브라우저로 **`https://<PUBLIC_HOST>/ui`** 를 열면 SSH 나 `.env` 편집 없이 운영할 수 있다. 로그인은 `.env` 의 `ADMIN_TOKEN`

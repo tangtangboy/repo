@@ -7,6 +7,9 @@
             회신 URL 설정 여부 출력. 주문 없음.
   simulate  TEST 시크릿으로 서명한 합성 신호를 entry→add→partial_exit→protection_update→full_exit 순으로 전송.
   sign      파일 본문에 현재 ts 를 넣고 서명 헤더 + curl 예시 출력 (상대 테스트용).
+  export    라이브 신호 로그 내보내기 (CSV/JSONL, 백테스트 입력).
+  backfill  계정 트레이드 히스토리(체결·청산손익·입출금·자산) 를 거래소에서 거슬러 받아 DB 에 적재 (history.py).
+  performance  계정별 시드 대비 PnL/ROI·수수료·낙폭·승률 (metrics.py) 출력 (--json 은 대시보드 API 와 같은 형식).
 
 시크릿은 출력하지 않는다(존재 여부만). 실거래소 호출은 check 에서도 읽기 전용뿐이다.
 """
@@ -198,10 +201,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
                                     schema=settings.db_schema),
         state_dir=settings.state_dir, settings=settings)
 
+    # 계정 트레이드 히스토리 적재 (history.py): 거래소 체결·청산손익·입출금·자산 → DB. 전용 연결, 주문 경로와 분리.
+    history = None
+    if settings.history_enabled:
+        from .history import HistorySync, build_sources
+        history = HistorySync(
+            settings,
+            store_factory=lambda: Store(settings.ledger_target, legacy_account=settings.legacy_account_name(),
+                                        schema=settings.db_schema),
+            sources=build_sources(settings, exchanges), alerts=alerts)
+
     # paths/started_ms 는 대시보드(web.py) 가 쓴다: .env/config.json 편집 대상 경로와 재시작 가드의 기준 시각
     services = SimpleNamespace(executor=executor, reporter=reporter, alerts=alerts, exchanges=exchanges,
                                paths=SimpleNamespace(env=args.env, config=args.config), started_ms=now_ms(),
-                               signal_log=signal_log)
+                               signal_log=signal_log, history=history)
     app = create_app(settings, store, services)
 
     stop_event = threading.Event()
@@ -227,6 +240,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                          daemon=True),
         threading.Thread(target=signal_log.run_forever, args=(stop_event,), name="signal-log", daemon=True),
     ]
+    if history is not None:
+        threads.append(threading.Thread(target=history.run_forever, args=(stop_event,), name="history", daemon=True))
     for t in threads:
         t.start()
 
@@ -704,6 +719,105 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _history_sync_for(settings, store_factory):
+    """backfill CLI: enabled 계정의 거래소(실키 있으면 실거래소, 아니면 Paper) 로 히스토리 소스를 만든다."""
+    from .history import HistorySync, build_sources
+    exchanges = _exchanges_for(settings, strict=False)
+    return HistorySync(settings, store_factory=store_factory, sources=build_sources(settings, exchanges), alerts=None)
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """거래소 트레이드 히스토리 백필: --since 부터 (--until 까지) 체결·청산손익·입출금을 받아 DB 에 적재 (멱등)."""
+    from .store import Store
+    try:
+        settings = _load_settings(args)
+        since, until = parse_when(args.since), parse_when(args.until)
+    except (config.ConfigError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    if since is None:
+        print("ERROR: --since is required (YYYY-MM-DD, YYYY-MM-DDTHH:MM or Unix ms)", file=sys.stderr)
+        return 2
+
+    def factory():
+        return Store(settings.ledger_target, legacy_account=settings.legacy_account_name(), schema=settings.db_schema)
+
+    sync = _history_sync_for(settings, factory)
+    names = [args.account] if args.account else sorted((sync.sources.get(args.mode) or {}).keys())
+    if not names:
+        print(f"ERROR: no history source for mode={args.mode} (live needs real keys; test needs test.simulate_fills)",
+              file=sys.stderr)
+        return 2
+    rc = 0
+    try:
+        for name in names:
+            try:
+                res = sync.backfill(args.mode, name, since, until)
+            except KeyError as e:
+                print(f"{args.mode}/{name}: {e}", file=sys.stderr)
+                rc = 2
+                continue
+            except Exception as e:  # noqa: BLE001
+                print(f"{args.mode}/{name}: FAILED {type(e).__name__}: {e}", file=sys.stderr)
+                rc = 1
+                continue
+            ins = res["inserted"]
+            print(f"{args.mode}/{name}: executions +{ins.get('executions', 0)} closed_pnl +{ins.get('closed_pnl', 0)} "
+                  f"cashflow +{ins.get('cashflow', 0)} equity_snapshot={'yes' if res.get('equity') else 'no'}")
+    finally:
+        sync.close()
+    return rc
+
+
+def _fmt_pct(v) -> str:
+    return "-" if v is None else f"{v * 100:+.2f}%"
+
+
+def _fmt_num(v) -> str:
+    return "-" if v is None else f"{v:,.4f}"
+
+
+def cmd_performance(args: argparse.Namespace) -> int:
+    """계정별 성과 (metrics.account_performance). --json 은 대시보드 /ui/api/performance.json 과 같은 구조."""
+    from .metrics import performance_all
+    from .store import Store
+    try:
+        settings = _load_settings(args)
+        since, until = parse_when(args.since), parse_when(args.until)
+    except (config.ConfigError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    store = Store(settings.ledger_target, legacy_account=settings.legacy_account_name(), schema=settings.db_schema)
+    try:
+        rows = performance_all(store, settings, args.mode, since, until,
+                               accounts=[args.account] if args.account else None)
+    finally:
+        store.close()
+    if args.json:
+        print(json.dumps({"mode": args.mode, "since_ms": since, "until_ms": until, "accounts": rows},
+                         ensure_ascii=False, indent=2))
+        return 0
+    for r in rows:
+        c, eq, led = r["closed"], r["equity"], r["ledger"]
+        print(f"== {r['mode']}/{r['account']} ({r.get('exchange')} {r.get('symbol')} x{r.get('leverage')})")
+        print(f"  seed {_fmt_num(r['seed'])} ({r.get('seed_source') or 'n/a'}) · equity now {_fmt_num(r['equity_now'])}"
+              f" · net deposits {_fmt_num(r['net_deposits'])} (in {_fmt_num(r['deposits'])} / out {_fmt_num(r['withdrawals'])})")
+        print(f"  pnl total {_fmt_num(r['pnl_total'])} · ROI vs seed {_fmt_pct(r['roi_vs_seed'])} · ROI vs net deposits "
+              f"{_fmt_pct(r['roi_vs_net_deposits'])} · unrealised {_fmt_num(r['unrealised_pnl'])}")
+        print(f"  closed pnl {_fmt_num(c['realized_closed_pnl'])} over {c['trades']} trades (win {c['wins']} / loss {c['losses']},"
+              f" win rate {_fmt_pct(c['win_rate'])}, profit factor {_fmt_num(c['profit_factor'])}) · fees {_fmt_num(r['fees'])}"
+              f" · funding {_fmt_num(r['funding'])} · executions {r['executions']}")
+        print(f"  equity points {eq['points']} · peak {_fmt_num(eq.get('peak'))} · max drawdown {_fmt_num(eq.get('max_drawdown'))}"
+              f" ({_fmt_pct(eq.get('max_drawdown_pct'))})")
+        print(f"  ledger realized {_fmt_num(led['realized'])} by strategy {led['by_strategy']} · open {len(led['open_positions'])}"
+              f" · fills {led['fills']}")
+        if r["sync"]:
+            print("  sync: " + ", ".join(f"{k} last={v['last_ts_ms']}" for k, v in r["sync"].items()))
+        else:
+            print("  sync: never (run `backfill` or let serve sync)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m lake_executor",
                                 description="lake-executor: lake webhook -> Bybit executor")
@@ -767,6 +881,24 @@ def build_parser() -> argparse.ArgumentParser:
     xp.add_argument("--out", default=None, help="file path (default: stdout)")
     xp.add_argument("--limit", default=100000, type=int)
     xp.set_defaults(func=cmd_export)
+
+    bp = sub.add_parser("backfill", help="pull account trade history (executions / closed pnl / cashflow / equity) "
+                                        "from the exchange into the DB (idempotent)")
+    _add_config_args(bp, suppress=True)
+    bp.add_argument("--mode", choices=["test", "live"], default="live")
+    bp.add_argument("--account", default=None, help="account name (default: every account with a history source)")
+    bp.add_argument("--since", required=True, help="UTC: YYYY-MM-DD, YYYY-MM-DDTHH:MM or Unix ms (inclusive)")
+    bp.add_argument("--until", default=None, help="UTC: same formats (exclusive; default now)")
+    bp.set_defaults(func=cmd_backfill)
+
+    pp = sub.add_parser("performance", help="per-account PnL / ROI vs seed / fees / drawdown / win rate from the ingested history")
+    _add_config_args(pp, suppress=True)
+    pp.add_argument("--mode", choices=["test", "live"], default="live")
+    pp.add_argument("--account", default=None)
+    pp.add_argument("--since", default=None, help="UTC: YYYY-MM-DD, YYYY-MM-DDTHH:MM or Unix ms (inclusive)")
+    pp.add_argument("--until", default=None, help="UTC: same formats (exclusive)")
+    pp.add_argument("--json", action="store_true", help="print the same JSON as /ui/api/performance.json")
+    pp.set_defaults(func=cmd_performance)
     return p
 
 

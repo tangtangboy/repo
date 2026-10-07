@@ -358,6 +358,96 @@ CREATE TABLE IF NOT EXISTS signal_log (
 )""",
 }
 
+# ---- 계정(사용자) 트레이드 히스토리 적재 (history.py 가 쓰고 metrics.py/대시보드가 읽는다). 전부 (mode, account) 단위.
+TABLES.update({
+    "account_executions": """
+CREATE TABLE IF NOT EXISTS account_executions (
+  mode           TEXT NOT NULL,
+  account        TEXT NOT NULL,
+  exec_id        TEXT NOT NULL,
+  exchange       TEXT,
+  symbol         TEXT,
+  order_id       TEXT,
+  order_link_id  TEXT,
+  side           TEXT,
+  qty            REAL NOT NULL,
+  price          REAL NOT NULL,
+  fee            REAL,
+  fee_currency   TEXT,
+  exec_type      TEXT,
+  closed_size    REAL,
+  position_idx   INTEGER,
+  exec_time_ms   INTEGER NOT NULL,
+  ingested_at_ms INTEGER NOT NULL,
+  raw            TEXT,
+  PRIMARY KEY (mode, account, exec_id)
+)""",
+    "account_closed_pnl": """
+CREATE TABLE IF NOT EXISTS account_closed_pnl (
+  mode            TEXT NOT NULL,
+  account         TEXT NOT NULL,
+  pnl_id          TEXT NOT NULL,
+  exchange        TEXT,
+  symbol          TEXT,
+  order_id        TEXT,
+  side            TEXT,
+  qty             REAL NOT NULL,
+  avg_entry_price REAL,
+  avg_exit_price  REAL,
+  closed_pnl      REAL NOT NULL,
+  leverage        REAL,
+  position_idx    INTEGER,
+  created_at_ms   INTEGER NOT NULL,
+  updated_at_ms   INTEGER,
+  ingested_at_ms  INTEGER NOT NULL,
+  raw             TEXT,
+  PRIMARY KEY (mode, account, pnl_id)
+)""",
+    "account_equity": """
+CREATE TABLE IF NOT EXISTS account_equity (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  mode           TEXT NOT NULL,
+  account        TEXT NOT NULL,
+  ts_ms          INTEGER NOT NULL,
+  total_equity   REAL NOT NULL,
+  wallet_balance REAL,
+  unrealised_pnl REAL,
+  available      REAL,
+  source         TEXT
+)""",
+    "account_cashflow": """
+CREATE TABLE IF NOT EXISTS account_cashflow (
+  mode           TEXT NOT NULL,
+  account        TEXT NOT NULL,
+  flow_id        TEXT NOT NULL,
+  ts_ms          INTEGER NOT NULL,
+  type           TEXT NOT NULL,
+  amount         REAL NOT NULL,
+  currency       TEXT,
+  raw            TEXT,
+  ingested_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (mode, account, flow_id)
+)""",
+    "sync_state": """
+CREATE TABLE IF NOT EXISTS sync_state (
+  mode          TEXT NOT NULL,
+  account       TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  last_ts_ms    INTEGER NOT NULL DEFAULT 0,
+  cursor        TEXT,
+  updated_at_ms INTEGER NOT NULL,
+  note          TEXT,
+  PRIMARY KEY (mode, account, kind)
+)""",
+})
+
+EXEC_COLS = ("mode", "account", "exec_id", "exchange", "symbol", "order_id", "order_link_id", "side", "qty", "price", "fee",
+             "fee_currency", "exec_type", "closed_size", "position_idx", "exec_time_ms", "ingested_at_ms", "raw")
+CLOSED_PNL_COLS = ("mode", "account", "pnl_id", "exchange", "symbol", "order_id", "side", "qty", "avg_entry_price",
+                   "avg_exit_price", "closed_pnl", "leverage", "position_idx", "created_at_ms", "updated_at_ms",
+                   "ingested_at_ms", "raw")
+CASHFLOW_COLS = ("mode", "account", "flow_id", "ts_ms", "type", "amount", "currency", "raw", "ingested_at_ms")
+
 SIGNAL_LOG_COLS = ("received_at_ms", "mode", "event_id", "position_id", "event_sequence", "strategy", "strategy_name",
                    "action", "leg", "position_idx", "exchange", "symbol", "qty_btc", "expected_qty_btc_after",
                    "reference_price", "stop_loss", "take_profit", "protection_revision", "signal_ts", "expires_at_ms",
@@ -370,6 +460,10 @@ INDEXES: dict[str, list[tuple[str, str]]] = {   # table -> [(index name, DDL)]
     "fills": [("ix_fills_link", "CREATE INDEX IF NOT EXISTS ix_fills_link ON fills(account, order_link_id)")],
     "reports": [("ix_reports_state", "CREATE INDEX IF NOT EXISTS ix_reports_state ON reports(mode, account, state, sequence)")],
     "signal_log": [("ix_signal_log_time", "CREATE INDEX IF NOT EXISTS ix_signal_log_time ON signal_log(mode, received_at_ms)")],
+    "account_executions": [("ix_acct_exec_time", "CREATE INDEX IF NOT EXISTS ix_acct_exec_time ON account_executions(mode, account, exec_time_ms)")],
+    "account_closed_pnl": [("ix_acct_pnl_time", "CREATE INDEX IF NOT EXISTS ix_acct_pnl_time ON account_closed_pnl(mode, account, created_at_ms)")],
+    "account_equity": [("ix_acct_equity_time", "CREATE INDEX IF NOT EXISTS ix_acct_equity_time ON account_equity(mode, account, ts_ms)")],
+    "account_cashflow": [("ix_acct_cash_time", "CREATE INDEX IF NOT EXISTS ix_acct_cash_time ON account_cashflow(mode, account, ts_ms)")],
 }
 
 # 계정 컬럼이 추가된 테이블 (1단계 → 2 마이그레이션 대상, 이 순서로)
@@ -1064,6 +1158,112 @@ class Store:
 
     def report_counts(self) -> list[dict]:
         return self._q("SELECT mode,state,COUNT(*) AS n FROM reports GROUP BY mode,state ORDER BY mode,state")
+
+    # ------------------------------------------------------------------ 계정 트레이드 히스토리 (history.py 가 쓰고 metrics.py 가 읽는다)
+    def _upsert_rows(self, table: str, cols: tuple[str, ...], rows: list[dict]) -> int:
+        """INSERT OR IGNORE 로 여러 행. 새로 들어간 행 수 반환 (재실행/백필 중복은 0)."""
+        if not rows:
+            return 0
+        t = now_ms()
+        n = 0
+        with self._tx():
+            for r in rows:
+                vals = []
+                for c in cols:
+                    v = r.get(c)
+                    if c == "ingested_at_ms" and v is None:
+                        v = t
+                    if c == "raw" and v is not None and not isinstance(v, str):
+                        v = json.dumps(v, ensure_ascii=False)[:4000]
+                    vals.append(v)
+                cur = self._conn.execute(
+                    f"INSERT OR IGNORE INTO {table}({','.join(cols)}) VALUES({','.join('?' * len(cols))})", tuple(vals))
+                n += 1 if cur.rowcount == 1 else 0
+        return n
+
+    def upsert_executions(self, rows: list[dict]) -> int:
+        return self._upsert_rows("account_executions", EXEC_COLS, rows)
+
+    def upsert_closed_pnl(self, rows: list[dict]) -> int:
+        return self._upsert_rows("account_closed_pnl", CLOSED_PNL_COLS, rows)
+
+    def upsert_cashflows(self, rows: list[dict]) -> int:
+        return self._upsert_rows("account_cashflow", CASHFLOW_COLS, rows)
+
+    def insert_equity(self, mode: str, account: str, ts_ms: int, total_equity: float, wallet_balance: float | None = None,
+                      unrealised_pnl: float | None = None, available: float | None = None, source: str = "sync") -> None:
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO account_equity(mode,account,ts_ms,total_equity,wallet_balance,unrealised_pnl,available,source) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (mode, account, int(ts_ms), float(total_equity), wallet_balance, unrealised_pnl, available, source))
+
+    def get_sync_state(self, mode: str, account: str, kind: str) -> dict | None:
+        return self._q1("SELECT * FROM sync_state WHERE mode=? AND account=? AND kind=?", (mode, account, kind))
+
+    def set_sync_state(self, mode: str, account: str, kind: str, last_ts_ms: int, cursor: str | None = None,
+                       note: str = "") -> None:
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO sync_state(mode,account,kind,last_ts_ms,cursor,updated_at_ms,note) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(mode,account,kind) DO UPDATE SET last_ts_ms=excluded.last_ts_ms, cursor=excluded.cursor, "
+                "updated_at_ms=excluded.updated_at_ms, note=excluded.note",
+                (mode, account, kind, int(last_ts_ms), cursor, now_ms(), note[:300]))
+
+    def sync_states(self, mode: str | None = None, account: str | None = None) -> list[dict]:
+        where, params = self._where([("mode", mode), ("account", account)])
+        return self._q(f"SELECT * FROM sync_state{where} ORDER BY mode, account, kind", tuple(params))
+
+    @staticmethod
+    def _range_where(col: str, since_ms: int | None, until_ms: int | None) -> tuple[str, list]:
+        parts, params = [], []
+        if since_ms is not None:
+            parts.append(f"{col}>=?"); params.append(int(since_ms))
+        if until_ms is not None:
+            parts.append(f"{col}<?"); params.append(int(until_ms))
+        return (" AND " + " AND ".join(parts)) if parts else "", params
+
+    def account_executions(self, mode: str, account: str, since_ms: int | None = None, until_ms: int | None = None,
+                           limit: int = 100000) -> list[dict]:
+        extra, params = self._range_where("exec_time_ms", since_ms, until_ms)
+        return self._q(f"SELECT * FROM account_executions WHERE mode=? AND account=?{extra} ORDER BY exec_time_ms, exec_id LIMIT ?",
+                       (mode, account, *params, int(limit)))
+
+    def account_closed_pnl(self, mode: str, account: str, since_ms: int | None = None, until_ms: int | None = None,
+                           limit: int = 100000) -> list[dict]:
+        extra, params = self._range_where("created_at_ms", since_ms, until_ms)
+        return self._q(f"SELECT * FROM account_closed_pnl WHERE mode=? AND account=?{extra} ORDER BY created_at_ms, pnl_id LIMIT ?",
+                       (mode, account, *params, int(limit)))
+
+    def account_cashflows(self, mode: str, account: str, since_ms: int | None = None, until_ms: int | None = None,
+                          limit: int = 100000) -> list[dict]:
+        extra, params = self._range_where("ts_ms", since_ms, until_ms)
+        return self._q(f"SELECT * FROM account_cashflow WHERE mode=? AND account=?{extra} ORDER BY ts_ms, flow_id LIMIT ?",
+                       (mode, account, *params, int(limit)))
+
+    def account_equity_series(self, mode: str, account: str, since_ms: int | None = None, until_ms: int | None = None,
+                              limit: int = 100000) -> list[dict]:
+        extra, params = self._range_where("ts_ms", since_ms, until_ms)
+        return self._q(f"SELECT * FROM account_equity WHERE mode=? AND account=?{extra} ORDER BY ts_ms, id LIMIT ?",
+                       (mode, account, *params, int(limit)))
+
+    def account_equity_latest(self, mode: str, account: str) -> dict | None:
+        return self._q1("SELECT * FROM account_equity WHERE mode=? AND account=? ORDER BY ts_ms DESC, id DESC LIMIT 1", (mode, account))
+
+    def account_equity_first(self, mode: str, account: str) -> dict | None:
+        return self._q1("SELECT * FROM account_equity WHERE mode=? AND account=? ORDER BY ts_ms ASC, id ASC LIMIT 1", (mode, account))
+
+    def ledger_fills_joined(self, mode: str, account: str, since_ms: int | None = None, until_ms: int | None = None,
+                            limit: int = 100000) -> list[dict]:
+        """우리 체결(fills) 에 주문(side/reduce_only/purpose) 과 lot(strategy/leg/position_idx) 을 붙인다 — 전략별 실현손익 귀속용."""
+        extra, params = self._range_where("f.exec_time_ms", since_ms, until_ms)
+        return self._q(
+            "SELECT f.exec_id, f.qty, f.price, f.exec_time_ms, f.position_id, f.event_id, f.order_link_id, "
+            "o.side, o.reduce_only, o.purpose, l.strategy, l.leg, l.position_idx "
+            "FROM fills f LEFT JOIN orders o ON o.account=f.account AND o.order_link_id=f.order_link_id "
+            "LEFT JOIN lots l ON l.mode=f.mode AND l.account=f.account AND l.position_id=f.position_id "
+            f"WHERE f.mode=? AND f.account=?{extra} ORDER BY f.exec_time_ms, f.exec_id LIMIT ?",
+            (mode, account, *params, int(limit)))
 
     # ------------------------------------------------------------------ 라이브 신호 로그 (signal_log.py 가 쓰고, export/대시보드가 읽는다)
     def append_signal_log(self, row: dict) -> bool:

@@ -22,7 +22,9 @@
       "testnet": false,
       "env_prefix": "BYBIT",
       "qty_multiplier": 1.0,
-      "report": true
+      "report": true,
+      "_comment_seed": "성과(ROI) 기준 시드 USDT. 생략하면 첫 자산 스냅샷을 시드로 본다",
+      "seed_usdt": 1000
     },
     {
       "name": "okx",
@@ -68,6 +70,9 @@
     "_comment_expired": "만료(expires_at_ms) 뒤 도착/처리돼도 실행할 action. 서버 끊김 뒤 재연결 때 청산·보호가격 변경을 버리지 않는다. entry/add 는 넣지 말 것",
     "expired_actions_execute": ["partial_exit", "full_exit", "protection_update"]
   },
+
+  "_comment_history": "계정 트레이드 히스토리 적재 (history.py): 거래소 체결·청산손익·입출금·자산을 sync_interval_s 마다 증분으로, 자산 스냅샷은 equity_interval_s 마다 한 줄. 첫 동기화는 backfill_days 만큼 거슬러 간다. 더 과거는 `python -m lake_executor backfill --since …` 또는 대시보드 Performance → Backfill",
+  "history": { "enabled": true, "sync_interval_s": 60, "equity_interval_s": 300, "backfill_days": 30 },
 
   "_comment_database": "원장 백엔드. .env 의 DATABASE_URL(postgres://…, Supabase 세션 풀러 5432) 이 있으면 Postgres 의 이 스키마에, 없으면 state/lake.db(SQLite)",
   "database": { "schema": "lake_executor" },

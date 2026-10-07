@@ -505,9 +505,13 @@ class PaperExchange(ExchangeBase):
     name = "paper"
 
     def __init__(self, account, price: float = 85000.0, instrument: dict | None = None, clock=None, *,
-                 lot_protection: bool = True):
-        """account: config.AccountSettings (display_name 은 account.exchange 를 따른다). 1단계 호환으로 Settings 도 받는다."""
+                 lot_protection: bool = True, id_tag: str = ""):
+        """account: config.AccountSettings (display_name 은 account.exchange 를 따른다). 1단계 호환으로 Settings 도 받는다.
+        id_tag: 주문/체결 ID 접두어 ("porder-<tag>-N", "pexec-<tag>-N"). 원장이 영구(Postgres/SQLite 파일) 이므로 운영(serve) 에서는
+        프로세스마다 다른 태그를 줘야 재시작 뒤 'pexec-1' 이 이전 프로세스의 체결과 (account, exec_id) 로 충돌해 무시되지 않는다
+        (build_exchange 가 넣는다). 테스트는 빈 태그(결정적 ID) 를 쓴다."""
         self.account = _as_account(account)
+        self._id_tag = f"{id_tag}-" if id_tag else ""
         self.settings = self.account     # 하위 호환 속성명
         self.display_name = EXCHANGE_DISPLAY.get(self.account.exchange, "Bybit")
         self.supports_lot_protection = bool(lot_protection)
@@ -743,7 +747,7 @@ class PaperExchange(ExchangeBase):
                    kind: str, trigger_price: float | None = None, trigger_direction: int | None = None,
                    trigger_by: str | None = None) -> dict:
         self._order_seq += 1
-        oid = f"porder-{self._order_seq}"
+        oid = f"porder-{self._id_tag}{self._order_seq}"
         t = self._clock()
         o = {
             "order_id": oid, "order_link_id": order_link_id, "side": side, "qty": qty, "cum_qty": 0.0,
@@ -786,7 +790,7 @@ class PaperExchange(ExchangeBase):
                 o["qty"] = qty
 
         self._exec_seq += 1
-        ex = {"exec_id": f"pexec-{self._exec_seq}", "qty": qty, "price": price, "exec_time_ms": t,
+        ex = {"exec_id": f"pexec-{self._id_tag}{self._exec_seq}", "qty": qty, "price": price, "exec_time_ms": t,
               "order_id": o["order_id"]}
         self._execs[o["order_id"]].append(ex)
         o["cum_qty"] = qty
@@ -848,7 +852,9 @@ def build_exchange(account, kind: str | None = None, price: float | None = None)
     if k == "paper":
         # 계정 거래소의 최소 수량/step 을 그대로 쓴다 (test 결과가 live 의 QTY_BELOW_MIN 판정을 예측하도록)
         instr = PAPER_INSTRUMENTS.get(str(acct.exchange or "").lower())
-        return PaperExchange(acct, price=85000.0 if price is None else float(price), instrument=instr)
+        # 프로세스마다 다른 ID 태그: 영구 원장에서 이전 프로세스의 paper 체결 ID 와 충돌하지 않도록 (test 모드 재시작 뒤 QTY_MISMATCH 방지)
+        return PaperExchange(acct, price=85000.0 if price is None else float(price), instrument=instr,
+                             id_tag=f"{now_ms() % 10**9:x}")
     if k == "bybit":
         return BybitExchange(acct)
     if k == "okx":

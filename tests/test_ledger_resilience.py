@@ -208,3 +208,21 @@ def test_dashboard_exposes_database_url_key_and_ledger_row(client, settings, ser
     assert "@" not in page.split("ledger", 1)[1][:300]      # 접속 문자열(비밀번호) 은 절대 안 보인다
     secrets_page = client.get("/ui/secrets", follow_redirects=False).text
     assert "DATABASE_URL" in secrets_page
+
+
+# ---------------------------------------------------------------- paper exchange ids must not collide across restarts
+def test_paper_exchange_ids_are_tagged_in_production_factory(settings):
+    from lake_executor.exchange import PaperExchange, build_exchange
+    acct = settings.accounts[0]
+    plain = PaperExchange(acct)
+    o = plain.place_market("Buy", 0.001, 1, False, "lk-plain")
+    assert o["order_id"] == "porder-1" and plain.executions("porder-1")[0]["exec_id"] == "pexec-1"   # 테스트는 결정적
+    tagged = PaperExchange(acct, id_tag="abc")
+    o2 = tagged.place_market("Buy", 0.001, 1, False, "lk-tagged")
+    assert o2["order_id"] == "porder-abc-1" and tagged.executions("porder-abc-1")[0]["exec_id"] == "pexec-abc-1"
+    # 운영 팩토리(test 모드 simulate_fills) 는 프로세스마다 다른 태그를 붙인다 → 재시작 뒤 이전 체결 ID 와 충돌하지 않는다
+    ex = build_exchange(acct, kind="paper")
+    assert isinstance(ex, PaperExchange)
+    o3 = ex.place_market("Buy", 0.001, 1, False, "lk-prod")
+    assert o3["order_id"].startswith("porder-") and o3["order_id"] != "porder-1"
+    assert ex.executions(o3["order_id"])[0]["exec_id"] != "pexec-1"

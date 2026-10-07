@@ -10,6 +10,7 @@
   export    라이브 신호 로그 내보내기 (CSV/JSONL, 백테스트 입력).
   backfill  계정 트레이드 히스토리(체결·청산손익·입출금·자산) 를 거래소에서 거슬러 받아 DB 에 적재 (history.py).
   performance  계정별 시드 대비 PnL/ROI·수수료·낙폭·승률 (metrics.py) 출력 (--json 은 대시보드 API 와 같은 형식).
+  replica   장부 복제본(DATABASE_URL) 상태 / pull(복제본 → 새 로컬 장부, 컷오버·재해복구) / init(로컬 → 빈 복제본) (replica.py).
 
 시크릿은 출력하지 않는다(존재 여부만). 실거래소 호출은 check 에서도 읽기 전용뿐이다.
 """
@@ -143,6 +144,28 @@ def _snapshot_loop(settings, executor, exchanges: dict[str, dict[str, Any]], sto
     log.info("snapshot loop stopped")
 
 
+def _throttled_alert(settings, alerts, key: str, text: str, every_ms: int = 300_000) -> None:
+    """같은 알림을 every_ms 에 한 번만 (기동 실패가 systemd 재시도로 반복될 때 알림 폭주 방지). 상태 파일로 기억한다."""
+    path = os.path.join(settings.state_dir, f".alert-{key}")
+    try:
+        last = int(open(path, encoding="utf-8").read().strip() or 0) if os.path.exists(path) else 0
+    except (OSError, ValueError):
+        last = 0
+    now = now_ms()
+    if now - last < every_ms:
+        return
+    try:
+        os.makedirs(settings.state_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(now))
+    except OSError:
+        pass
+    try:
+        alerts.send(text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -150,7 +173,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from .ops import Alerts, setup_logging
     from .receiver import create_app
     from .reporter import Reporter
-    from .store import Store
+    from .store import Store, describe_target
 
     settings = _load_settings(args)
     setup_logging(settings)
@@ -167,12 +190,38 @@ def cmd_serve(args: argparse.Namespace) -> int:
                   type(e).__name__)
         raise config.ConfigError(f"ledger open failed: {type(e).__name__}") from e
     log.info("ledger: %s", store.describe())
+    # 장부가 로컬 SQLite 이고 DATABASE_URL 이 있으면 외부 DB 는 비동기 복제본: 변경 로그(트리거) 를 켜고 복제 스레드가 뒤따른다.
+    # 복제가 없으면 트리거를 내려 큐가 자라지 않게 한다.
+    replicator = None
+    if settings.replica_url:
+        from .replica import Replicator
+        store.enable_replication_log()
+        log.info("replica: %s (async; trade path stays on the local ledger)", describe_target(settings.replica_url))
+    elif store.backend == "sqlite":
+        store.disable_replication_log()
     try:
         verify_ledger_accounts(settings, store)   # 설정에 없는 계정의 open lot/pending 회신 → ConfigError (exit 2)
     except config.ConfigError:
         store.close()
         raise
     alerts = Alerts(settings)
+    if settings.replica_url:
+        from .replica import NotLinked, startup_check
+        replicator = Replicator(
+            local_factory=lambda: Store(settings.ledger_target, legacy_account=settings.legacy_account_name()),
+            target_factory=lambda: Store(settings.replica_url, legacy_account=settings.legacy_account_name(),
+                                         schema=settings.db_schema),
+            alerts=alerts)
+        replicator.halt_file = settings.halt_file
+        try:
+            log.info("replica: %s", startup_check(replicator))
+        except NotLinked as e:
+            # 안전장치: 링크가 안 맞는(오래된/빈) 장부로 매매를 시작하지 않는다. systemd 가 재시도하므로 알림은 5분에 한 번.
+            log.error("replica: %s", e)
+            _throttled_alert(settings, alerts, "replica_unlinked", f"[serve] refusing to start: {e}")
+            replicator.close()
+            store.close()
+            raise config.ConfigError(f"replica: {e}") from e
     reporter = Reporter(settings, store, alerts)
     try:
         exchanges = _exchanges_for(settings, strict=True)
@@ -214,7 +263,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # paths/started_ms 는 대시보드(web.py) 가 쓴다: .env/config.json 편집 대상 경로와 재시작 가드의 기준 시각
     services = SimpleNamespace(executor=executor, reporter=reporter, alerts=alerts, exchanges=exchanges,
                                paths=SimpleNamespace(env=args.env, config=args.config), started_ms=now_ms(),
-                               signal_log=signal_log, history=history)
+                               signal_log=signal_log, history=history, replica=replicator)
     app = create_app(settings, store, services)
 
     stop_event = threading.Event()
@@ -242,6 +291,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     ]
     if history is not None:
         threads.append(threading.Thread(target=history.run_forever, args=(stop_event,), name="history", daemon=True))
+    if replicator is not None:
+        threads.append(threading.Thread(target=replicator.run_forever, args=(stop_event,), name="replica", daemon=True))
     for t in threads:
         t.start()
 
@@ -360,10 +411,60 @@ def _check_account(acct, ex_factory) -> int:
     return problems
 
 
+def _check_replica(settings) -> int:
+    """복제본(DATABASE_URL, database.ledger=local) 점검: 접속·왕복·링크·큐. 반환: 문제 수 (복제 문제는 매매를 막지 않는다 → 경고만)."""
+    from .replica import LINK_META_KEY, STATE_TABLE
+    from .store import Store, describe_target
+    try:
+        tgt = Store(settings.replica_url, legacy_account=settings.legacy_account_name(), schema=settings.db_schema)
+    except Exception as e:  # noqa: BLE001
+        print(f"replica           : {describe_target(settings.replica_url)} schema={settings.db_schema}  CONNECT FAILED ({type(e).__name__})"
+              " — trading continues on the local ledger; changes queue locally")
+        return 0
+    try:
+        rtt = tgt.ping_ms()
+        with tgt._lock:
+            tgt._conn.executescript(f"CREATE TABLE IF NOT EXISTS {STATE_TABLE} (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            r = tgt._conn.execute(f"SELECT value FROM {STATE_TABLE} WHERE key=?", ("link",)).fetchone()
+        theirs = r[0] if r else None
+        mine = None
+        queue = 0
+        if os.path.exists(settings.db_path):
+            import sqlite3
+            conn = sqlite3.connect(f"file:{settings.db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute("SELECT value FROM meta WHERE key=?", (LINK_META_KEY,)).fetchone()
+                mine = row[0] if row else None
+                has_q = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='repl_queue'").fetchone()
+                queue = int(conn.execute("SELECT COUNT(*) FROM repl_queue").fetchone()[0]) if has_q else 0
+            except sqlite3.Error:
+                pass
+            finally:
+                conn.close()
+        linked = bool(mine and theirs and mine == theirs)
+        state = "linked" if linked else ("NOT LINKED — stop the service, then `python -m lake_executor replica pull --yes` "
+                                         "(replica has the data) or `replica init --yes` (local has the data)"
+                                         if (mine or theirs) else
+                                         "no link yet — serve links automatically only if BOTH sides are empty; otherwise run "
+                                         "`replica pull --yes` / `replica init --yes` with the service stopped")
+        print(f"replica           : {tgt.describe()}  round-trip {rtt:.0f} ms  {state}  queued changes={queue}")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"replica           : query failed ({type(e).__name__})")
+        return 0
+    finally:
+        tgt.close()
+
+
 def _check_ledger(settings) -> int:
-    """원장 점검. DATABASE_URL 이 있으면 Postgres 에 실제로 접속해 왕복 시간과 원장 계정을 출력하고, 없으면 SQLite 파일을 읽는다."""
-    if not settings.db_url:
-        return _check_ledger_sqlite(settings)
+    """원장 점검. database.ledger=remote 면 Postgres 에 실제로 접속해 왕복 시간과 원장 계정을 출력하고,
+    아니면 SQLite 파일을 읽고 (DATABASE_URL 이 있으면) 복제본도 점검한다."""
+    if not settings.db_url or settings.db_ledger != "remote":
+        rc = _check_ledger_sqlite(settings)
+        print(f"ledger            : sqlite {settings.db_path} (local; trade path never waits on the network)")
+        if settings.replica_url:
+            rc += _check_replica(settings)
+        return rc
     from .store import Store, describe_target
     try:
         store = Store(settings.ledger_target, legacy_account=settings.legacy_account_name(), schema=settings.db_schema)
@@ -818,6 +919,107 @@ def cmd_performance(args: argparse.Namespace) -> int:
     return 0
 
 
+def _service_answers(settings) -> bool:
+    """로컬 수신기가 /healthz 에 답하면 서비스가 떠 있는 것 (pull/init 은 서비스가 멈춘 상태에서만)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://{settings.listen_host}:{settings.listen_port}/healthz", timeout=1.5) as r:
+            return r.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def cmd_replica(args: argparse.Namespace) -> int:
+    """replica status | pull | init (replica.py). pull/init 는 서비스가 멈춘 상태에서 실행할 것."""
+    from . import replica as rp
+    from .store import Store, describe_target
+    try:
+        settings = _load_settings(args)
+    except config.ConfigError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    if not settings.replica_url:
+        print("ERROR: no replica configured (needs DATABASE_URL in .env and database.ledger=local)", file=sys.stderr)
+        return 2
+    local_path = settings.db_path
+
+    def open_target():
+        return Store(settings.replica_url, legacy_account=settings.legacy_account_name(), schema=settings.db_schema)
+
+    if args.replica_cmd == "status":
+        tgt = open_target()
+        local = Store(local_path, legacy_account=settings.legacy_account_name())
+        try:
+            mine = local.get_meta(rp.LINK_META_KEY)
+            theirs = rp._Target(tgt).get_state("link")
+            last_id = rp._Target(tgt).get_state("last_id")
+            print(f"local  : sqlite {local_path}  link={mine or '-'}  queued changes={local.repl_queue_len()}"
+                  f"  triggers={'on' if local.replication_enabled() else 'off'}")
+            print(f"replica: {tgt.describe()}  link={theirs or '-'}  last_applied_id={last_id or 0}  round-trip {tgt.ping_ms():.0f} ms")
+            print("linked : " + ("yes" if (mine and theirs and mine == theirs) else "NO"))
+            for t, (a, b) in rp.compare(local, tgt).items():
+                print(f"  {t:22s} local={a:7d} replica={b:7d}{'' if a == b else '  <- differs (queued/lag?)'}")
+        finally:
+            local.close()
+            tgt.close()
+        return 0
+
+    if not args.yes:
+        print("ERROR: add --yes (stop the service first: pull/init rewrite the ledger link)", file=sys.stderr)
+        return 2
+    if args.replica_cmd in ("pull", "init") and _service_answers(settings):
+        print(f"ERROR: lake-executor is running on {settings.listen_host}:{settings.listen_port}; stop it first "
+              "(sudo systemctl stop lake-executor)", file=sys.stderr)
+        return 2
+    if args.replica_cmd == "pull":
+        tgt = open_target()
+        tmp = local_path + ".pull.tmp"
+        for p in (tmp, tmp + "-wal", tmp + "-shm"):
+            if os.path.exists(p):
+                os.remove(p)
+        local = Store(tmp, legacy_account=settings.legacy_account_name())
+        try:
+            counts = rp.pull(tgt, local)
+        finally:
+            local.close()
+            tgt.close()
+        for suffix in ("-wal", "-shm"):                      # 새 파일의 WAL 은 close 로 체크포인트됐다; 남은 건 지운다
+            if os.path.exists(tmp + suffix):
+                os.remove(tmp + suffix)
+        if os.path.exists(local_path):
+            bak = f"{local_path}.bak-{now_ms()}"
+            os.replace(local_path, bak)
+            for suffix in ("-wal", "-shm"):                  # 옛 WAL 이 새 파일에 적용되지 않도록 반드시 치운다
+                if os.path.exists(local_path + suffix):
+                    os.replace(local_path + suffix, bak + suffix)
+            print(f"previous ledger kept as {bak}")
+        os.replace(tmp, local_path)
+        link = counts.pop("_link")
+        print(f"pulled {describe_target(settings.replica_url)} -> sqlite {local_path}  link={link[:8]}…")
+        for t, n in counts.items():
+            print(f"  {t:22s} {n} rows")
+        return 0
+
+    if args.replica_cmd == "init":
+        tgt = open_target()
+        local = Store(local_path, legacy_account=settings.legacy_account_name())
+        try:
+            counts = rp.init_push(local, tgt, force=bool(args.force))
+        except rp.ReplicaError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+        finally:
+            local.close()
+            tgt.close()
+        link = counts.pop("_link")
+        dropped = counts.pop("_dropped_queue_rows", 0)
+        print(f"pushed sqlite {local_path} -> {describe_target(settings.replica_url)}  link={link[:8]}…  (queue reset, {dropped} rows dropped)")
+        for t, n in counts.items():
+            print(f"  {t:22s} {n} rows")
+        return 0
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m lake_executor",
                                 description="lake-executor: lake webhook -> Bybit executor")
@@ -899,6 +1101,20 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--until", default=None, help="UTC: same formats (exclusive)")
     pp.add_argument("--json", action="store_true", help="print the same JSON as /ui/api/performance.json")
     pp.set_defaults(func=cmd_performance)
+
+    rp_ = sub.add_parser("replica", help="ledger replica (DATABASE_URL): status / pull (replica -> new local ledger) / init (local -> empty replica)")
+    _add_config_args(rp_, suppress=True)
+    rsub = rp_.add_subparsers(dest="replica_cmd", required=True)
+    rs = rsub.add_parser("status", help="link state, queued changes, per-table row counts")
+    _add_config_args(rs, suppress=True)
+    rpull = rsub.add_parser("pull", help="copy ALL tables from the replica into a fresh local ledger and link (service must be stopped)")
+    _add_config_args(rpull, suppress=True)
+    rpull.add_argument("-y", "--yes", action="store_true")
+    rinit = rsub.add_parser("init", help="push the local ledger into an EMPTY replica and link (service must be stopped)")
+    _add_config_args(rinit, suppress=True)
+    rinit.add_argument("-y", "--yes", action="store_true")
+    rinit.add_argument("--force", action="store_true", help="overwrite rows in a non-empty replica by primary key")
+    rp_.set_defaults(func=cmd_replica)
     return p
 
 

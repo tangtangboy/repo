@@ -194,6 +194,7 @@ class Executor:
         self.exchanges: dict[str, dict[str, ExchangeBase]] = self._normalize_exchanges(exchanges)
         self.reporter = reporter
         self.alerts = alerts
+        self.wake = threading.Event()          # 수신기가 접수 직후 set → 0.2초 폴링을 기다리지 않고 바로 집어간다
         self._lock = threading.RLock()
         # test(paper) 모드: 신호의 reference_price 로 모의 시세를 움직인다 (lake TEST 신호가 SLIPPAGE_GUARD 로 죽지 않도록)
         self.follow_reference_price_on_paper = True
@@ -305,7 +306,8 @@ class Executor:
                 failing = None
             backoff = 1.0
             if not worked:
-                stop_event.wait(0.2)
+                self.wake.wait(0.2)
+                self.wake.clear()
         log.info("executor loop stopped")
 
     # ------------------------------------------------------------------ 시작

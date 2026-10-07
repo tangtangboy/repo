@@ -78,7 +78,12 @@ def test_database_config_validation(settings_factory):
     assert s.expired_actions_execute == ["partial_exit", "full_exit", "protection_update"]
     ok = settings_factory(env_overrides={"DATABASE_URL": "postgresql://u:p@aws-1-ap-south-1.pooler.supabase.com:5432/postgres"},
                           config_overrides={"database": {"schema": "lake_x"}, "guards": {"expired_actions_execute": ["full_exit"]}})
-    assert ok.ledger_target.startswith("postgresql://") and ok.db_schema == "lake_x" and ok.expired_actions_execute == ["full_exit"]
+    # 기본(database.ledger=local): 장부는 SQLite, DATABASE_URL 은 비동기 복제본. remote 로 바꾸면 URL 이 장부가 된다.
+    assert ok.ledger_target.endswith("lake.db") and ok.replica_url.startswith("postgresql://")
+    assert ok.db_schema == "lake_x" and ok.expired_actions_execute == ["full_exit"]
+    remote = settings_factory(config_overrides={"database": {"schema": "lake_x", "ledger": "remote"}},
+                              env_overrides={"DATABASE_URL": "postgresql://u:p@aws-1-ap-south-1.pooler.supabase.com:5432/postgres"})
+    assert remote.ledger_target.startswith("postgresql://") and remote.replica_url == ""
     with pytest.raises(config.ConfigError, match="transaction pooler"):
         settings_factory(env_overrides={"DATABASE_URL": "postgresql://u:p@aws-1-ap-south-1.pooler.supabase.com:6543/postgres"})
     with pytest.raises(config.ConfigError, match="query parameters"):

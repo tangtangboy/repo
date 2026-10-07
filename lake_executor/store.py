@@ -175,6 +175,35 @@ class _PgConn:
                     raise LedgerUnavailable(f"postgres error: {type(e).__name__}") from e
         raise LedgerUnavailable("postgres unreachable")  # pragma: no cover
 
+    def executemany(self, sql: str, seq_of_params) -> None:
+        """여러 행을 한 문장으로 (psycopg 가 가능하면 파이프라인으로 보낸다 — 복제 배치용)."""
+        import psycopg
+        rows = [tuple(p) for p in seq_of_params]
+        if not rows:
+            return
+        q = translate_pg(sql, True)
+        for attempt in (0, 1):
+            if self._conn is None or self.broken:
+                if self.in_tx:
+                    self.in_tx = False
+                    raise LedgerUnavailable("postgres connection lost inside a transaction")
+                self._connect()
+            try:
+                with self._conn.cursor() as cur:
+                    cur.executemany(q, rows)
+                return
+            except (psycopg.OperationalError, psycopg.InterfaceError) as e:
+                self.broken = True
+                try:
+                    self._conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._conn = None
+                if self.in_tx or attempt == 1:
+                    self.in_tx = False
+                    raise LedgerUnavailable(f"postgres error: {type(e).__name__}") from e
+        raise LedgerUnavailable("postgres unreachable")  # pragma: no cover
+
     def executescript(self, script: str) -> None:
         for stmt in script.split(";"):
             if stmt.strip():
@@ -448,6 +477,11 @@ CLOSED_PNL_COLS = ("mode", "account", "pnl_id", "exchange", "symbol", "order_id"
                    "ingested_at_ms", "raw")
 CASHFLOW_COLS = ("mode", "account", "flow_id", "ts_ms", "type", "amount", "currency", "raw", "ingested_at_ms")
 
+REPL_QUEUE_DDL = ("CREATE TABLE IF NOT EXISTS repl_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, "
+                  "op TEXT NOT NULL, row TEXT NOT NULL, created_at_ms INTEGER NOT NULL)")
+REPL_DEAD_DDL = ("CREATE TABLE IF NOT EXISTS repl_dead (id INTEGER PRIMARY KEY, tbl TEXT NOT NULL, op TEXT NOT NULL, "
+                 "row TEXT NOT NULL, created_at_ms INTEGER NOT NULL, error TEXT NOT NULL, dead_at_ms INTEGER NOT NULL)")
+
 SIGNAL_LOG_COLS = ("received_at_ms", "mode", "event_id", "position_id", "event_sequence", "strategy", "strategy_name",
                    "action", "leg", "position_idx", "exchange", "symbol", "qty_btc", "expected_qty_btc_after",
                    "reference_price", "stop_loss", "take_profit", "protection_revision", "signal_ts", "expires_at_ms",
@@ -524,6 +558,7 @@ class Store:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA recursive_triggers=ON")   # INSERT OR REPLACE 의 암묵 DELETE 도 복제 트리거에 잡히게
             self._rowid = "rowid"
             self._contains_body = "instr(body, ?) > 0"
         with self._lock:
@@ -534,6 +569,164 @@ class Store:
             self._conn.executescript(SCHEMA)
             if self.get_meta("schema_version") is None:
                 self.set_meta("schema_version", SCHEMA_VERSION)
+
+    # ------------------------------------------------------------------ 복제 로그 (replica.py; SQLite 장부 전용)
+    REPL_EXCLUDE = ("repl_queue", "repl_dead", "sqlite_sequence")
+
+    def replicated_tables(self) -> list[str]:
+        """복제 대상 테이블 (sqlite 내부 테이블과 큐 자체 제외), 이름순."""
+        with self._lock:
+            if self.backend == "sqlite":
+                rows = self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+                names = [r[0] for r in rows]
+            else:
+                names = sorted(TABLES.keys())
+        # 알려진(TABLES) 테이블만: 마이그레이션이 남긴 *_old 같은 임시 테이블은 복제본에 없다
+        return [n for n in names if n not in self.REPL_EXCLUDE and not n.startswith("sqlite_") and n in TABLES]
+
+    def table_schema(self, table: str) -> dict:
+        """{"cols": [...], "types": {col: declared type}, "pk": [pk cols in key order]} (PRAGMA table_info; SQLite 전용)."""
+        if self.backend != "sqlite":
+            raise RuntimeError("table_schema is only available on the SQLite ledger")
+        with self._lock:
+            info = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        cols = [r[1] for r in info]
+        types = {r[1]: (r[2] or "").upper() for r in info}
+        pk = [r[1] for r in sorted((r for r in info if r[5]), key=lambda r: r[5])]
+        return {"cols": cols, "types": types, "pk": pk}
+
+    def count_rows(self, table: str) -> int:
+        with self._lock:
+            return int(self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+    def _repl_triggers(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'repl\\_%' ESCAPE '\\'").fetchall()
+        return [r[0] for r in rows]
+
+    def enable_replication_log(self) -> list[str]:
+        """repl_queue 테이블 + 테이블마다 INSERT/UPDATE/DELETE(+PK 변경) 트리거. 매번 다시 만든다(열 변경 대비). 반환: 테이블 목록."""
+        if self.backend != "sqlite":
+            raise RuntimeError("replication log is only available on the SQLite ledger")
+        with self._lock:
+            self._conn.execute(REPL_QUEUE_DDL)
+            self._conn.execute(REPL_DEAD_DDL)
+            self._conn.execute("DROP INDEX IF EXISTS ix_repl_queue_id")      # INTEGER PRIMARY KEY 가 곧 rowid — 인덱스 불필요
+            for trg in self._repl_triggers():
+                self._conn.execute(f"DROP TRIGGER IF EXISTS {trg}")
+            tables = self.replicated_tables()
+            for t in tables:
+                s = self.table_schema(t)
+                if not s["pk"]:
+                    continue
+                if len(s["cols"]) > 60:
+                    raise RuntimeError(f"table {t} has {len(s['cols'])} columns; json_object() supports at most 63 pairs")
+
+                def jexpr(prefix: str, cols: list[str]) -> str:
+                    # REAL 은 17자리로 찍어(정확히 복원) 문자열로, BLOB 은 hex 로, 그 외는 값 그대로 (blob 이 섞여 들어와도 트리거가 죽지 않게 hex)
+                    parts = []
+                    for c in cols:
+                        v = f"{prefix}.{c}"
+                        if s["types"].get(c) == "BLOB":
+                            parts.append(f"'{c}', CASE WHEN {v} IS NULL THEN NULL ELSE hex({v}) END")
+                        else:
+                            # 선언 타입이 BLOB 이 아닌 열에 bytes 가 들어오면 {"$hex": …} 로 표시해 복제기가 복원한다 (트리거가 죽지 않게)
+                            parts.append(f"'{c}', CASE WHEN typeof({v})='real' THEN printf('%!.17g', {v}) "
+                                         f"WHEN typeof({v})='blob' THEN json_object('$hex', hex({v})) ELSE {v} END")
+                    return "json_object(" + ", ".join(parts) + ")"
+                ts = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
+                ins = f"INSERT INTO repl_queue(tbl, op, row, created_at_ms) VALUES('{t}', '%s', %s, {ts})"
+                # meta.replica_* (복제 링크 등 이 장부-복제본 쌍의 메타) 는 복제하지 않는다
+                when_new = " WHEN (NEW.key NOT LIKE 'replica\\_%' ESCAPE '\\')" if t == "meta" else ""
+                when_old = " WHEN (OLD.key NOT LIKE 'replica\\_%' ESCAPE '\\')" if t == "meta" else ""
+                self._conn.execute(f"CREATE TRIGGER repl_{t}_i AFTER INSERT ON {t}{when_new} BEGIN {ins % ('upsert', jexpr('NEW', s['cols']))}; END")
+                self._conn.execute(f"CREATE TRIGGER repl_{t}_u AFTER UPDATE ON {t}{when_new} BEGIN {ins % ('upsert', jexpr('NEW', s['cols']))}; END")
+                self._conn.execute(f"CREATE TRIGGER repl_{t}_d AFTER DELETE ON {t}{when_old} BEGIN {ins % ('delete', jexpr('OLD', s['pk']))}; END")
+                pk_changed = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in s["pk"])
+                when_k = f" WHEN (({pk_changed})" + (" AND OLD.key NOT LIKE 'replica\\_%' ESCAPE '\\'" if t == "meta" else "") + ")"
+                self._conn.execute(f"CREATE TRIGGER repl_{t}_k AFTER UPDATE OF {', '.join(s['pk'])} ON {t}{when_k} "
+                                   f"BEGIN {ins % ('delete', jexpr('OLD', s['pk']))}; END")
+        return tables
+
+    def disable_replication_log(self) -> None:
+        """트리거 제거 + 큐 비우기 + **링크 제거**. 복제 없이 돈 뒤에는 복제본이 뒤처져 있으므로, 다시 복제를 켤 때
+        `replica pull`/`init` 으로 새로 맞추게 강제한다 (링크가 남아 있으면 그 공백이 조용히 사라진다)."""
+        if self.backend != "sqlite":
+            return
+        with self._lock:
+            for trg in self._repl_triggers():
+                self._conn.execute(f"DROP TRIGGER IF EXISTS {trg}")
+            if self._table_exists("repl_queue"):
+                self._conn.execute("DELETE FROM repl_queue")
+            if self._table_exists("meta"):
+                self._conn.execute("DELETE FROM meta WHERE key='replica_link'")
+
+    def replication_enabled(self) -> bool:
+        return self.backend == "sqlite" and bool(self._repl_triggers())
+
+    def repl_fetch(self, limit: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT id, tbl, op, row, created_at_ms FROM repl_queue ORDER BY id LIMIT ?",
+                                      (int(limit),)).fetchall()
+        return [{"id": int(r[0]), "tbl": r[1], "op": r[2], "row": json.loads(r[3]), "created_at_ms": int(r[4] or 0)} for r in rows]
+
+    def repl_ack(self, max_id: int) -> int:
+        with self._tx():
+            cur = self._conn.execute("DELETE FROM repl_queue WHERE id<=?", (int(max_id),))
+            return int(cur.rowcount or 0)
+
+    def repl_queue_len(self) -> int:
+        with self._lock:
+            if self.backend != "sqlite" or not self._table_exists("repl_queue"):
+                return 0
+            return int(self._conn.execute("SELECT COUNT(*) FROM repl_queue").fetchone()[0])
+
+    def repl_queue_seq(self) -> int:
+        """repl_queue 의 AUTOINCREMENT 시퀀스(지금까지 발급된 최대 id). 복제본 last_id 와 비교해 '다른/오래된 장부' 를 잡는다."""
+        with self._lock:
+            if self.backend != "sqlite" or not self._table_exists("sqlite_sequence"):
+                return 0
+            r = self._conn.execute("SELECT seq FROM sqlite_sequence WHERE name='repl_queue'").fetchone()
+            return int(r[0] or 0) if r else 0
+
+    def repl_fetch_same_ms(self, after_id: int, created_at_ms: int, limit: int = 5000) -> list[dict]:
+        """배치 경계가 같은 밀리초의 행(대개 같은 트랜잭션) 을 가르지 않도록 이어서 읽는다."""
+        with self._lock:
+            rows = self._conn.execute("SELECT id, tbl, op, row, created_at_ms FROM repl_queue WHERE id>? AND created_at_ms=? "
+                                      "ORDER BY id LIMIT ?", (int(after_id), int(created_at_ms), int(limit))).fetchall()
+        return [{"id": int(r[0]), "tbl": r[1], "op": r[2], "row": json.loads(r[3]), "created_at_ms": int(r[4] or 0)} for r in rows]
+
+    def repl_queue_oldest_ms(self) -> int:
+        with self._lock:
+            if self.backend != "sqlite" or not self._table_exists("repl_queue"):
+                return 0
+            r = self._conn.execute("SELECT created_at_ms FROM repl_queue ORDER BY id LIMIT 1").fetchone()   # id 는 단조증가
+            return int(r[0] or 0) if r else 0
+
+    def repl_dead_add(self, row: dict, error: str) -> None:
+        """복제본이 영구적으로 거부한 큐 행을 격리(dead-letter) 하고 큐에서 뺀다 — 뒤의 행들이 막히지 않도록."""
+        with self._tx():
+            self._conn.execute(REPL_DEAD_DDL)
+            self._conn.execute("INSERT OR REPLACE INTO repl_dead(id, tbl, op, row, created_at_ms, error, dead_at_ms) "
+                               "VALUES(?,?,?,?,?,?,?)",
+                               (int(row["id"]), row["tbl"], row["op"], json.dumps(row["row"], ensure_ascii=False),
+                                int(row.get("created_at_ms") or 0), str(error)[:500], now_ms()))
+            self._conn.execute("DELETE FROM repl_queue WHERE id=?", (int(row["id"]),))
+
+    def repl_dead_count(self) -> int:
+        with self._lock:
+            if self.backend != "sqlite" or not self._table_exists("repl_dead"):
+                return 0
+            return int(self._conn.execute("SELECT COUNT(*) FROM repl_dead").fetchone()[0])
+
+    def repl_dead_rows(self, limit: int = 50) -> list[dict]:
+        with self._lock:
+            if self.backend != "sqlite" or not self._table_exists("repl_dead"):
+                return []
+            rows = self._conn.execute("SELECT id, tbl, op, row, created_at_ms, error, dead_at_ms FROM repl_dead ORDER BY id LIMIT ?",
+                                      (int(limit),)).fetchall()
+        return [{"id": r[0], "tbl": r[1], "op": r[2], "row": json.loads(r[3]), "created_at_ms": r[4], "error": r[5], "dead_at_ms": r[6]}
+                for r in rows]
 
     # ------------------------------------------------------------------ backend info
     def describe(self) -> str:

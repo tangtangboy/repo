@@ -74,8 +74,8 @@
   "_comment_history": "계정 트레이드 히스토리 적재 (history.py): 거래소 체결·청산손익·입출금·자산을 sync_interval_s 마다 증분으로, 자산 스냅샷은 equity_interval_s 마다 한 줄. 첫 동기화는 backfill_days 만큼 거슬러 간다. 더 과거는 `python -m lake_executor backfill --since …` 또는 대시보드 Performance → Backfill",
   "history": { "enabled": true, "sync_interval_s": 60, "equity_interval_s": 300, "backfill_days": 30 },
 
-  "_comment_database": "원장 백엔드. .env 의 DATABASE_URL(postgres://…, Supabase 세션 풀러 5432) 이 있으면 Postgres 의 이 스키마에, 없으면 state/lake.db(SQLite)",
-  "database": { "schema": "lake_executor" },
+  "_comment_database": "장부는 서버의 state/lake.db(SQLite, 주문 경로). .env 의 DATABASE_URL(Supabase 세션 풀러 5432) 이 있으면 그 Postgres 는 비동기 복제본(ledger=local, 기본). ledger=remote 는 옛 동작(DATABASE_URL 이 장부 자체; 같은 리전일 때만)",
+  "database": { "schema": "lake_executor", "ledger": "local" },
 
   "report": {
     "snapshot_interval_ms": 30000,

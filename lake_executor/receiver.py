@@ -457,6 +457,12 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
             log.error("insert_signal failed: %s", type(e).__name__)
             return _json(500, {"error": "INTERNAL", "code": "STORE_ERROR"})
 
+        if result == "new":                                   # 실행기를 깨운다 (폴링 대기 없이 바로 처리)
+            ex = _svc(services, "executor")
+            wake = getattr(ex, "wake", None)
+            if wake is not None:
+                wake.set()
+
         # 라이브 신호 로그 (백테스트용): 큐에 넣기만 한다 — 주문 경로를 기다리게 하지 않고, 실패해도 응답에 영향 없음
         if result in ("new", "duplicate"):
             slog = _svc(services, "signal_log")

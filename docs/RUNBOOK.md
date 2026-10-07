@@ -21,8 +21,10 @@
 | 설정 반영 | 로컬에서 `.env`/`config.json` 수정 → `python deploy/finalize.py`, 또는 **대시보드 Accounts/Secrets 에서 저장 → Controls → Apply & restart**(§5) | 업로드(600) → `check` → 재시작 / 서버 파일 직접 갱신 → 재시작 |
 | 재시작 (대시보드) | Controls → **Apply & restart** | SIGTERM → 정상 종료 → systemd 가 5초 뒤 재기동. 기동 60초 뒤부터, 60초 간격, 5분 3회 제한 |
 | **코드 반영** | 지금은 `python deploy/finalize.py --keep-remote-env --keep-remote-config`. (준비 중: `git push` → 서버가 2분 안에 pull, Controls → **Deploy from GitHub now**) | 준비 중인 자동 배포는 pull → compileall·pytest·`check` 통과 시 재시작, 실패 시 직전 커밋으로 롤백 (`deploy/README.md` §5a) |
-| **원장 DB 전환** | `.env` `DATABASE_URL=postgres://…`(Supabase 세션 풀러 5432) → `check` → 재시작 | SQLite(`state/lake.db`) ↔ Postgres. 전환은 열린 lot 없을 때; 회신 sequence 1부터 (`deploy/README.md` §5b) |
-| **원장 불통 (Postgres)** | 자동 | 수신기 `503 LEDGER_UNAVAILABLE`+`Retry-After`(lake 재전송), 실행기 1→30초 백오프·알림 5분 1회, 회복 시 "loop recovered" 알림. Overview `ledger` 행이 `UNAVAILABLE` 로 바뀐다 |
+| **장부 / 복제본** | 장부 = `state/lake.db`(SQLite, 주문 경로). `.env` `DATABASE_URL` = 비동기 복제본. `python -m lake_executor replica status` | 복제본 끊김은 매매와 무관(큐가 서버에 쌓임). Overview `replica` 행: `in sync` / `catching up (N queued)` / `NOT LINKED` / `paused`. 링크가 안 맞으면 serve 가 기동을 거부 → 서비스 정지 후 `replica pull --yes`(복제본이 진실) 또는 `replica init --yes`(로컬이 진실) → 시작 |
+| **복제 FENCED + HALT** | 알림 `[replica] FENCED + HALT` | 쌍둥이/복원된 옛 장부가 감지돼 이 프로세스가 복제를 멈추고 HALT 를 걸었다. 어느 장부가 진실인지 정한 뒤 `replica pull`(복제본이 진실) 또는 `replica init --force`(이 장부가 진실) → HALT 해제 → 재시작 |
+| **복제 격리(dead)** | `replica status` 의 dead 수 / 알림 `quarantined` | 복제본이 거부한 행(제약·스키마) 만 `repl_dead` 에 두고 나머지는 계속 흐른다. 원인을 고친 뒤 `replica init --force` 로 다시 맞춘다 |
+| **원장 불통 (Postgres, `database.ledger=remote` 일 때만)** | 자동 | 수신기 `503 LEDGER_UNAVAILABLE`+`Retry-After`(lake 재전송), 실행기 1→30초 백오프·알림 5분 1회, 회복 시 "loop recovered" 알림. Overview `ledger` 행이 `UNAVAILABLE` 로 바뀐다 |
 | **트레이드 히스토리 / 성과** | 자동(`history.enabled`, 기본 60초) · `python -m lake_executor backfill --mode live --since YYYY-MM-DD` · 대시보드 Performance → **Backfill now** | 거래소 체결·청산손익·입출금·자산을 DB 에 적재(멱등). `/ui/performance`, `/ui/api/performance.json`, `performance` CLI 에서 시드 대비 PnL/ROI·수수료·낙폭·승률. Overview `trade history sync` 행에 마지막 동기화/오류. 주문 경로와 분리 — 실패해도 매매에 영향 없음 |
 | **만료 신호 정책** | `config.json` `guards.expired_actions_execute` | 기본 `partial_exit/full_exit/protection_update` 는 `expires_at_ms` 가 지나도 접수·실행(run note `stale`), `entry/add` 는 `EXPIRED` 거부 |
 

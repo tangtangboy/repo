@@ -205,3 +205,25 @@ class Reporter:
   sync_interval_s, equity_interval_s, backfill_days}`, `accounts[].seed_usdt`.
 - **주문 경로와의 분리**: 수신기/실행기는 이 모듈을 호출하지 않는다. 거래소 히스토리 호출 실패·DB 실패는 다음 주기에
   재시도될 뿐 매매에 영향이 없다.
+
+## 13. 장부는 로컬 SQLite, 외부 DB 는 비동기 복제본 (replica.py)
+
+- **왜**: 장부가 다른 리전의 Postgres 에 있을 때 신호 하나의 94번 왕복(수신 6 · 주문 전 20 · 체결 기록 14 · 보호주문/회신 54) 이 전부 주문 경로에
+  들어가 12~16초(주문까지 3.5초) 가 걸렸다. 장부를 서버 안 SQLite 로 되돌리면 같은 흐름이 1초 안이고, 외부 DB 는 뒤에서 따라오는 복제본이 된다.
+- **변경 로그**: `Store.enable_replication_log()` 가 TABLES 의 모든 테이블에 AFTER INSERT/UPDATE(→ `upsert`, NEW 행 전체 json) /
+  DELETE·PK 변경(→ `delete`, PK json) 트리거를 만들어 `repl_queue(id AUTOINCREMENT, tbl, op, row, created_at_ms)` 에 적재한다.
+  같은 트랜잭션이라 변경과 큐가 원자적. REAL 은 `printf('%!.17g')`(비트 보존), BLOB 은 hex, 선언 타입과 다른 blob 은 `{"$hex": …}`.
+  `meta.replica_*` 는 제외. `PRAGMA recursive_triggers=ON` 으로 REPLACE 의 암묵 DELETE 도 잡는다. 기동 때마다 트리거를 다시 만든다(열 변경 대비).
+- **복제기** `Replicator`(전용 로컬 연결 `synchronous=NORMAL` + 전용 대상 연결): `check_link`(링크 일치 + 계보: 복제본 `last_id` ≤ 로컬 큐 시퀀스)
+  → `repl_fetch(500)`(같은 ms 의 행은 한 배치) → 워터마크 이하의 행은 복제본 `last_batch` 지문과 같을 때만(=COMMIT 뒤 ack 전 크래시) 버리고 아니면
+  `Fenced` → 키별 마지막 작업만 남겨 (table, op) 로 묶어 `executemany`(Postgres 는 파이프라인) → 같은 트랜잭션에서 `last_id`/`link` 를
+  compare-and-set(`UPDATE … WHERE value=?`, rowcount 1 아니면 `Fenced`), `last_batch`, autoincrement 시퀀스 `setval` → COMMIT → 로컬 `repl_ack`.
+  `Fenced` 면 HALT 파일 생성 + 알림 + 재시작 전까지 복제 중단. 일시 오류(LedgerUnavailable/OperationalError…) 는 1→30초 백오프, 영구 오류는
+  `quarantine_batch`(행 단위 적용, 거부 행은 `repl_dead`) 로 뒤의 행이 막히지 않게 한다. 지연 10분 초과·오류·회복은 알림(5분 1회).
+  대상에 없는 열은 접속 때 `ALTER TABLE ADD COLUMN`.
+- **링크/컷오버**: `pull`(복제본 → 새 SQLite; 한 스냅샷(REPEATABLE READ) 으로 읽고, 복제본에 (link, last_id=0) 를 먼저 쓴 뒤 로컬 링크를 마지막에),
+  `init`(로컬 → 빈 복제본, 한 트랜잭션), 양쪽 모두 비면 자동 링크. `serve` 는 `startup_check` 로 링크를 검증해 불일치면 `ConfigError`(exit 2),
+  복제본 불통이면 로컬 링크가 있을 때만 기동. `replica pull/init` 은 `/healthz` 가 응답하면(서비스 실행 중) 거부. 복제를 끄고 돌면
+  (`DATABASE_URL` 없음) 트리거·큐·링크를 지워 다음 링크 시 `pull/init` 을 강제한다.
+- **실행기 깨우기**: 수신기가 접수 직후 `executor.wake` 를 set → 0.2초 폴링 대기 없이 바로 처리.
+- **설정**: `database.ledger` = `local`(기본) | `remote`(옛 동작). `Settings.ledger_target`(Store 대상) / `Settings.replica_url`(복제 대상).

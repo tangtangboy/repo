@@ -147,7 +147,10 @@ class Settings:
     history_equity_interval_s: int = 300
     history_backfill_days: int = 30
 
-    db_schema: str = "lake_executor"      # Postgres 원장 스키마 (DATABASE_URL 이 있을 때만)
+    db_schema: str = "lake_executor"      # Postgres 스키마 (DATABASE_URL 이 있을 때만)
+    # database.ledger: "local"  = 장부는 서버의 SQLite(주문 경로, 왕복 0.1ms) 이고 DATABASE_URL 은 비동기 복제본 (기본)
+    #                  "remote" = DATABASE_URL 이 장부 그 자체 (모든 쿼리가 네트워크 왕복; 같은 리전일 때만 권장)
+    db_ledger: str = "local"
     # 만료(expires_at_ms 경과) 뒤 도착/처리되는 신호 중 그래도 실행할 action. 진입류(entry/add) 는 절대 넣지 않는 것을 권장:
     # 오래된 가격으로 새 포지션을 열면 안 되지만, 청산/보호가격 변경은 늦게라도 적용하는 편이 안전하다 (서버 끊김 뒤 재연결 복구).
     expired_actions_execute: list = field(default_factory=lambda: ["partial_exit", "full_exit", "protection_update"])
@@ -166,8 +169,17 @@ class Settings:
 
     @property
     def ledger_target(self) -> str:
-        """Store() 에 넘길 대상: Postgres URL 또는 SQLite 경로."""
-        return self.db_url or self.db_path
+        """Store() 에 넘길 장부: database.ledger=remote 이고 DATABASE_URL 이 있으면 Postgres URL, 아니면 SQLite 경로."""
+        if self.db_url and self.db_ledger == "remote":
+            return self.db_url
+        return self.db_path
+
+    @property
+    def replica_url(self) -> str:
+        """비동기 복제 대상 (database.ledger=local 이고 DATABASE_URL 이 있을 때). 비어 있으면 복제 없음."""
+        if self.db_url and self.db_ledger == "local":
+            return self.db_url
+        return ""
 
     @property
     def halt_file(self) -> str:
@@ -340,6 +352,7 @@ def load(config_path: str = "config.json", env_path: str = ".env", env_override:
     s.log_file = str(_get(cfg, "log_file", s.log_file) or "")
     s.routing = str(_get(cfg, "routing", s.routing))
     s.db_schema = str(_get(cfg, "database.schema", s.db_schema) or "lake_executor")
+    s.db_ledger = str(_get(cfg, "database.ledger", s.db_ledger) or "local").strip().lower()
     s.history_enabled = bool(_get(cfg, "history.enabled", s.history_enabled))
     s.history_sync_interval_s = int(_get(cfg, "history.sync_interval_s", s.history_sync_interval_s))
     s.history_equity_interval_s = int(_get(cfg, "history.equity_interval_s", s.history_equity_interval_s))
@@ -401,6 +414,8 @@ def validate_database(s: Settings) -> None:
     """DATABASE_URL / database.schema / guards.expired_actions_execute 검증 (값은 메시지에 넣지 않는다)."""
     if not _SCHEMA_RE.match(s.db_schema or ""):
         raise ConfigError("database.schema must match [a-z_][a-z0-9_]{0,62}")
+    if s.db_ledger not in ("local", "remote"):
+        raise ConfigError("database.ledger must be 'local' (SQLite ledger + async replica) or 'remote' (DATABASE_URL is the ledger)")
     bad = [a for a in s.expired_actions_execute if a not in _KNOWN_ACTIONS]
     if bad:
         raise ConfigError(f"guards.expired_actions_execute has unknown actions: {bad}")

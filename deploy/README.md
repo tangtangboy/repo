@@ -194,19 +194,24 @@ python deploy/ssh_run.py "sudo systemctl disable --now lake-executor-update.time
 - `finalize.py` 로 소스를 다시 올리면 다음 pull 때 `reset --hard` 로 덮인다 — 코드는 git 으로만, `finalize.py` 는
   `.env`/`config.json` 업로드(`--keep-remote-*` 주의)에만 쓴다.
 
-## 5b. 원장을 Postgres(Supabase) 로 — `DATABASE_URL`
+## 5b. 외부 DB(Supabase Postgres) 를 복제본으로 — `DATABASE_URL`
 
-기본 원장은 서버 디스크의 `state/lake.db` 다. 인스턴스가 사라지면 원장도 사라지므로 운영에서는 Postgres 를 권장한다.
+장부는 서버 디스크의 `state/lake.db` 다(주문 경로가 네트워크를 기다리지 않도록). `DATABASE_URL` 을 주면 그 Postgres 는 **비동기 복제본**이
+되어 대시보드/분석/재해복구에 쓴다 (`README.md` "장부 DB" 절).
 
-1. Supabase 프로젝트(서버와 같은 리전 권장) 의 **Session pooler** 연결 문자열을 받는다: `postgresql://postgres.<ref>:<pw>@aws-1-<region>.pooler.supabase.com:5432/postgres`
-   (`?pgbouncer=true` 같은 쿼리 파라미터는 떼고, 포트는 5432).
-2. `.env` 에 `DATABASE_URL=…` 한 줄 추가 (대시보드 Secrets 페이지에서도 넣을 수 있다; 저장 → Apply & restart). 스키마 이름은 `config.json` 의
-   `database.schema`(기본 `lake_executor`) — 같은 프로젝트의 다른 앱 테이블과 격리된다. 테이블은 기동 때 자동 생성.
-3. `pip install -r requirements.txt` 가 `psycopg[binary]` 를 넣었는지 확인하고(처음 한 번: `ssh_run.py "cd /home/ubuntu/lake-executor && ./.venv/bin/pip install -r requirements.txt"`),
-   `python -m lake_executor check` 로 `ledger : postgres host:5432/postgres schema=… round-trip N ms` 를 본 뒤 `finalize.py --keep-remote-config` (또는 대시보드 재시작).
-4. 열린 lot/pending 회신이 없는 때 전환한다. 기존 SQLite 행은 옮기지 않으며 회신 sequence 는 1부터 다시 시작한다 (lake 에 미리 알린다).
+1. Supabase 프로젝트(서버와 같은 리전이면 복제 지연이 ms 단위; 다른 리전이어도 매매에는 영향 없음) 의 **Session pooler** 연결 문자열:
+   `postgresql://postgres.<ref>:<pw>@aws-1-<region>.pooler.supabase.com:5432/postgres` (`?pgbouncer=true` 같은 쿼리 파라미터는 떼고 포트 5432).
+2. `.env` 에 `DATABASE_URL=…` 추가 (대시보드 Secrets 에서도 가능). 스키마는 `config.json` `database.schema`(기본 `lake_executor`), 테이블은 자동 생성.
+3. `python -m lake_executor check` → `ledger : sqlite state/lake.db (local…)` 와 `replica : postgres … linked|unlinked …` 를 확인.
+4. 링크 만들기 (처음 한 번, **서비스 정지 상태**에서):
+   - 복제본이 비어 있고 로컬 장부도 비어 있으면: 그냥 기동 → 자동 링크.
+   - 복제본에 데이터가 있고(예: 예전에 `ledger=remote` 로 쓰던 DB) 그것이 진실이면: `ssh_run.py "sudo systemctl stop lake-executor && cd /home/ubuntu/lake-executor && .venv/bin/python -m lake_executor replica pull --yes && sudo systemctl start lake-executor"`.
+   - 로컬 `state/lake.db` 가 진실이고 복제본은 비어 있으면: 같은 절차로 `replica init --yes` (복제본에 행이 있으면 `--force`).
+5. 기동 로그에 `replica: linked …` 가 보이고 Overview `replica (DATABASE_URL, async)` 행이 `in sync` 면 끝. 링크가 안 맞으면 **기동을 거부**하므로
+   (`CONFIG ERROR: replica: …`) 4번을 수행한다.
 
-왕복이 500ms 를 넘으면 `check` 가 경고한다 — 서버(서울) 와 다른 리전의 DB 는 신호 하나에 수십 쿼리라 수 초가 걸릴 수 있다. 되돌리려면 `DATABASE_URL` 을 비우고 재시작.
+DB 리전을 바꿀 때(예: 뭄바이 → 서울): 서비스 정지 → 새 프로젝트 URL 을 `.env` 에 → `replica init --yes`(로컬 장부를 새 복제본에 밀어 넣음) → 시작.
+옛 동작(Postgres 가 장부 자체) 이 필요하면 `config.json` `database.ledger: "remote"` — 그 뒤 다시 `local` 로 돌아올 때는 `replica pull` 로 로컬을 맞춘다.
 
 ## 6. 운영 명령 — `ssh_run.py`
 

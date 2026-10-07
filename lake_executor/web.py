@@ -861,6 +861,27 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
         rec = int(getattr(store, "reconnects", 0) or 0)
         return _Raw(f"{_status(state)} {_esc(text)}{_esc(rtt)}" + (f" reconnects={rec}" if rec else ""))
 
+    def _replica_summary() -> Any:
+        """복제본(DATABASE_URL) 상태: 링크 / 밀린 변경 수·지연 / 마지막 성공 / 오류."""
+        rep = rcv._svc(services, "replica")
+        if rep is None:
+            if getattr(settings, "db_ledger", "local") == "remote" and getattr(settings, "db_url", ""):
+                return _Raw('<span class="muted">n/a (database.ledger=remote: DATABASE_URL is the ledger itself)</span>')
+            return _Raw('<span class="muted">none (no DATABASE_URL) — ledger is the local SQLite only</span>')
+        try:
+            s = rep.status()
+        except Exception as e:  # noqa: BLE001
+            return _Raw(f"{_status('fail')} status error ({_esc(type(e).__name__)})")
+        if s.get("linked") is False:
+            state, text = "fail", "NOT LINKED — run `python -m lake_executor replica pull` (service stopped); changes queue locally"
+        elif s.get("last_error") and (not s.get("last_ok_ms") or s["last_error_ms"] > s["last_ok_ms"]):
+            state, text = "fail", f"paused: {s['last_error']}"
+        else:
+            state, text = "ok", "in sync" if not s.get("queue") else f"catching up ({s['queue']} queued, lag {s.get('lag_ms', 0) // 1000}s)"
+        tail = (f" · target {s.get('target') or '?'} · applied {s.get('applied_total', 0)} rows"
+                f" · last ok {_fmt_ms(s.get('last_ok_ms')) or 'never'}")
+        return _Raw(f"{_status(state)} {_esc(text)}{_esc(tail)}")
+
     def _history_summary() -> Any:
         """history.py 동기화 상태: 계정별 마지막 동기화 시각 / 누적 적재 행 / 오류 (Performance 페이지 링크)."""
         hist = rcv._svc(services, "history")
@@ -913,6 +934,7 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
             ("process started", f"{_fmt_ms(started_ms)} (uptime {_fmt_uptime(now_ms() - started_ms)})"),
             ("pending restart", (",".join(pend["keys"]) + " — restart required") if pend else "no"),
             ("ledger", _ledger_summary()),
+            ("replica (DATABASE_URL, async)", _replica_summary()),
             ("trade history sync", _history_summary()),
             ("expired actions still executed", ", ".join(getattr(settings, "expired_actions_execute", None) or []) or "none"),
             ("editing", (f"env={paths.env} config={paths.config}" if paths

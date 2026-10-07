@@ -179,24 +179,33 @@ AWS EC2(서울) + Elastic IP + Caddy(자동 HTTPS 443) → `127.0.0.1:8787` lake
 모든 거래소 API 키는 Elastic IP 로 IP 제한하므로 로컬에서 `check` 가 거래소 단계에서 실패하는 것이 정상이다.
 계정 추가 절차(키 권한, OKX passphrase·데모, Toobit 양방향 포지션)는 `docs/RUNBOOK.md` §6.
 
-## 원장 DB (SQLite 또는 Postgres/Supabase)
+## 장부 DB — 서버 안의 SQLite 가 장부, Postgres(Supabase) 는 비동기 복제본
 
-원장(신호·실행·lot·주문·체결·회신·meta)은 `.env` 의 **`DATABASE_URL`** 이 비어 있으면 서버 디스크의 `state/lake.db`(SQLite),
-`postgres://…` 면 그 Postgres 의 전용 스키마(`config.json` `database.schema`, 기본 `lake_executor`) 에 산다. 같은 코드·같은 SQL 이고
-`store.py` 가 실행 직전에 방언만 바꾼다. Supabase 는 **세션 풀러 주소(포트 5432, 쿼리 파라미터 없음)** 를 쓴다 — 트랜잭션 풀러(6543) 는
-`search_path` 가 유지되지 않아 설정 단계에서 거부된다. `python -m lake_executor check` 가 실제로 접속해 왕복 시간과 원장 계정을 보여 준다.
+장부(신호·실행·lot·주문·체결·회신·meta·히스토리) 는 **서버 디스크의 `state/lake.db`(SQLite)** 에 산다. 주문 경로의 모든 읽기·쓰기(신호
+하나에 90여 번) 가 서버 안에서 끝나므로(왕복 0.1ms) 수신 → 거래소 주문 → 체결 기록 → SL/TP 까지 전부 **1초 안**이다.
+`.env` 의 **`DATABASE_URL`** 이 있으면 그 Postgres 는 **비동기 복제본**이다: SQLite 트리거가 모든 변경을 `repl_queue` 에 같은 트랜잭션으로
+남기고, 복제 스레드(`replica.py`) 가 뒤에서 id 순으로 복제본에 적용한다(기본 0.5초 주기, 500행 배치). 복제본이 느리거나 끊겨도 **매매에는
+영향이 없고** 큐가 서버에 쌓였다가 따라간다. 복제본은 외부 대시보드/분석/재해복구용이다.
 
-왜 Postgres 인가: 서버가 죽거나 교체돼도 원장이 남아 **새 서버가 같은 lot·회신 순번에서 이어서** 처리한다. SQLite 는 EC2 디스크에만 있어
-인스턴스가 사라지면 원장도 사라진다. 전환은 `.env` 한 줄(+ 재시작)이고 되돌리기도 같다. 기존 SQLite 행은 자동으로 옮기지 않는다
-(열린 lot 이 없을 때 전환할 것; 회신 sequence 는 새 원장에서 1부터).
-
-**끊김 뒤 재연결 복구.** 원장(Postgres) 에 닿지 않으면 수신기는 `503 LEDGER_UNAVAILABLE` + `Retry-After` 로 답해 lake 가 재전송하게 하고
-(2xx 가 아니므로 접수된 것이 아니다), 실행기는 1→30초 백오프로 재시도하며 같은 오류 알림은 5분에 한 번만 보낸다. 트랜잭션 밖 문장은
-재접속 후 한 번 재시도한다. 재시작 뒤의 복구(processing 신호, pending 회신, 보호주문 대사)는 `docs/RUNBOOK.md` §8.
-**만료 정책** `guards.expired_actions_execute`(기본 `partial_exit`, `full_exit`, `protection_update`): 끊김 동안 밀렸다가 늦게 도착/처리되는
-신호 중 이 action 들은 `expires_at_ms` 가 지났어도 접수·실행하고 run note 에 `stale(...)` 로 남긴다. `entry`/`add` 는 절대 늦게 실행하지
-않는다(`EXPIRED` 거부) — 오래된 가격으로 새 포지션을 여는 것보다 청산·보호가격 변경을 버리는 쪽이 더 위험하기 때문이다. 빈 리스트로 두면
-예전처럼 전부 거부한다.
+- **설정** `config.json` `database.ledger`: `"local"`(기본, 위 구조) | `"remote"`(옛 동작: `DATABASE_URL` 이 장부 그 자체 — 모든 쿼리가
+  네트워크 왕복이라 같은 리전일 때만). Supabase 는 세션 풀러(5432, 쿼리 파라미터 없음). 스키마는 `database.schema`(기본 `lake_executor`).
+- **링크**: 로컬 장부와 복제본은 `replica_link` 로 짝지어져 있고(로컬 `meta`, 복제본 `lake_replica_state`), 짝이 아니면 복제하지 않는다.
+  `serve` 는 기동 때 링크를 검증해 **안 맞으면 기동을 거부**한다(오래된/빈 장부로 매매를 시작하지 않기 위해; systemd 가 재시도하며
+  알림은 5분 1회). 양쪽이 모두 비어 있으면 자동으로 짝을 만든다. 복제본에 닿지 않을 때는 로컬에 링크가 있으면 기동하고 뒤에서 재검증한다.
+- **컷오버/재해복구** `python -m lake_executor replica pull --yes`(서비스 정지 상태에서): 복제본의 모든 테이블을 새 `state/lake.db` 로
+  통째로 복사하고 새 링크를 만든다(이전 파일은 `.bak-<ms>` 로 보관). 새 서버에서 이어받을 때도 같은 명령. 반대로 로컬이 진실이고 복제본이
+  비어 있으면 `replica init --yes`(비어 있지 않으면 `--force` 로 PK 기준 덮어쓰기). `replica status` 가 링크·밀린 변경·테이블별 행 수를 보여 준다.
+- **안전장치**: 복제본 워터마크(`last_id`) 와 로컬 큐 시퀀스·마지막 배치 지문을 대조해 **복원된 옛 복사본/쌍둥이 장부**를 잡는다 —
+  어긋나면 그 프로세스는 복제를 멈추고 `state/HALT` 를 만들어 새 신호를 거부하며 알림을 보낸다(운영자가 `replica pull` 로 정리 후 재시작).
+  배치 적용은 compare-and-set 이라 두 장부가 번갈아 쓰는 일이 없다. 복제본이 특정 행을 영구적으로 거부하면(제약 위반 등) 그 행만
+  `repl_dead` 로 격리하고 뒤의 변경은 계속 흐른다(Overview/`replica status` 에 dead 수). 로컬에 새 열이 생기면 복제본에도 자동으로 추가한다.
+  `DATABASE_URL` 없이 한 번이라도 돌면 링크를 지우므로(그 사이 변경이 복제본에 없다) 다시 켤 때 `pull`/`init` 이 필요하다.
+- **정밀도**: REAL 은 17자리로 실어 비트 단위로 같고, BLOB 은 hex 로 싣는다. 복제된 autoincrement id 는 양쪽이 같으며 Postgres 시퀀스도
+  따라 올린다(나중에 `ledger=remote` 로 바꿔도 충돌 없음).
+- **끊김 뒤 재연결**: 장부가 서버 안에 있으므로 외부 DB 끊김은 복제 지연일 뿐이다. 재시작 뒤의 복구(processing 신호, pending 회신, 보호주문
+  대사) 는 `docs/RUNBOOK.md` §8. **만료 정책** `guards.expired_actions_execute`(기본 `partial_exit`, `full_exit`, `protection_update`):
+  밀렸다가 늦게 처리되는 신호 중 이 action 들은 `expires_at_ms` 가 지났어도 실행하고 run note 에 `stale(...)` 로 남긴다. `entry`/`add` 는
+  절대 늦게 실행하지 않는다(`EXPIRED` 거부).
 
 ## 라이브 신호 로그 (백테스트용 데이터셋)
 

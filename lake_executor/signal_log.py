@@ -104,6 +104,58 @@ def signal_to_row(sig: Any, ingest_result: str, received_at_ms: int, accounts: l
     }
 
 
+RECEIPT_COLUMNS = ("received_at_ms", "received_at", "mode", "event_id", "position_id", "event_sequence", "strategy", "action", "leg",
+                   "position_idx", "qty_btc", "body_sha256", "signal_status", "signal_reason", "processed_at_ms", "signal_note",
+                   "duplicate_count", "conflict_count")
+FILL_COLUMNS = ("mode", "account", "event_id", "position_id", "strategy", "leg", "position_idx", "action", "purpose", "side",
+                "reduce_only", "order_link_id", "order_id", "order_status", "order_qty", "exec_id", "exec_qty", "exec_price",
+                "exec_time_ms", "exec_time", "fee", "fee_currency", "exec_type")
+INGRESS_COLUMNS = ("id", "received_at_ms", "received_at", "code", "http", "event_id", "body_sha256", "note")
+EXPORT_KINDS = ("signals", "receipts", "fills", "ingress")
+
+
+def export_rows(store: Any, kind: str, mode: str | None, since_ms: int | None, until_ms: int | None,
+                limit: int = 100000) -> tuple[list[dict], tuple[str, ...]]:
+    """kind 별 내보내기 (행, 열). signals = 라이브 신호 로그(+우리 실행/체결 집계), receipts = 수신 원장,
+    fills = 주문·체결 원장, ingress = 서명 통과 뒤 거부/중복 기록."""
+    if kind == "signals":
+        return store.export_signal_rows(mode=mode, since_ms=since_ms, until_ms=until_ms, limit=limit), EXPORT_COLUMNS
+    if kind == "receipts":
+        return store.export_receipts(mode=mode, since_ms=since_ms, until_ms=until_ms, limit=limit), RECEIPT_COLUMNS
+    if kind == "fills":
+        return store.export_fills(mode=mode, since_ms=since_ms, until_ms=until_ms, limit=limit), FILL_COLUMNS
+    if kind == "ingress":
+        return store.export_ingress(since_ms=since_ms, until_ms=until_ms, limit=limit), INGRESS_COLUMNS
+    raise ValueError(f"unknown export kind {kind!r} (use one of {', '.join(EXPORT_KINDS)})")
+
+
+def _with_iso(r: dict) -> dict:
+    r = dict(r)
+    if "received_at_ms" in r:
+        r["received_at"] = iso_ms(r.get("received_at_ms"))
+    if "exec_time_ms" in r:
+        r["exec_time"] = iso_ms(r.get("exec_time_ms"))
+    return r
+
+
+def dicts_to_csv(rows: list[dict], columns: tuple[str, ...]) -> str:
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=list(columns), extrasaction="ignore", lineterminator="\n")
+    w.writeheader()
+    for r in rows:
+        r = _with_iso(r)
+        for k, v in list(r.items()):
+            if isinstance(v, (list, dict)):
+                r[k] = json.dumps(v, ensure_ascii=False)
+        w.writerow(r)
+    return buf.getvalue()
+
+
+def dicts_to_jsonl(rows: list[dict], columns: tuple[str, ...]) -> str:
+    out = [json.dumps({k: _with_iso(r).get(k) for k in columns}, ensure_ascii=False) for r in rows]
+    return "\n".join(out) + ("\n" if out else "")
+
+
 def rows_to_csv(rows: list[dict]) -> str:
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=list(EXPORT_COLUMNS), extrasaction="ignore", lineterminator="\n")

@@ -795,8 +795,9 @@ def parse_when(s: str | None) -> int | None:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    """라이브 신호 로그 내보내기 (백테스트 입력). signal_log × 계정별 실행 × 체결 집계 → CSV/JSONL."""
-    from .signal_log import rows_to_csv, rows_to_jsonl
+    """내보내기: --kind signals(라이브 신호 로그 + 우리 실행/체결 집계, 백테스트 입력) | receipts(수신 원장) | fills(주문·체결 원장)
+    | ingress(서명 통과 뒤 거부/중복 기록). lake 와의 사후 원장 대조용 (README "라이브 신호 로그" 절)."""
+    from .signal_log import dicts_to_csv, dicts_to_jsonl, export_rows
     from .store import Store
     try:
         settings = _load_settings(args)
@@ -806,10 +807,10 @@ def cmd_export(args: argparse.Namespace) -> int:
         return 2
     store = Store(settings.ledger_target, legacy_account=settings.legacy_account_name(), schema=settings.db_schema)
     try:
-        rows = store.export_signal_rows(mode=args.mode, since_ms=since, until_ms=until, limit=int(args.limit))
+        rows, columns = export_rows(store, getattr(args, "kind", "signals"), args.mode, since, until, int(args.limit))
     finally:
         store.close()
-    text = rows_to_jsonl(rows) if args.format == "jsonl" else rows_to_csv(rows)
+    text = dicts_to_jsonl(rows, columns) if args.format == "jsonl" else dicts_to_csv(rows, columns)
     if args.out:
         with open(args.out, "w", encoding="utf-8", newline="") as f:
             f.write(text)
@@ -1076,6 +1077,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     xp = sub.add_parser("export", help="export the live signal log (+ our runs/fills) as CSV or JSONL for backtesting")
     _add_config_args(xp, suppress=True)
+    xp.add_argument("--kind", choices=["signals", "receipts", "fills", "ingress"], default="signals",
+                    help="signals = live signal log + our runs/fills (backtest input); receipts = receipt ledger (one row per accepted "
+                         "event_id with body sha256 and duplicate counts); fills = order/execution ledger (event_id -> order -> exec); "
+                         "ingress = post-auth rejections/duplicates (409/410/400/200)")
     xp.add_argument("--mode", choices=["test", "live"], default=None, help="filter by mode (default: both)")
     xp.add_argument("--since", default=None, help="UTC: YYYY-MM-DD, YYYY-MM-DDTHH:MM or Unix ms (inclusive)")
     xp.add_argument("--until", default=None, help="UTC: same formats (exclusive)")

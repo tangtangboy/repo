@@ -1459,6 +1459,50 @@ class Store:
             f"WHERE f.mode=? AND f.account=?{extra} ORDER BY f.exec_time_ms, f.exec_id LIMIT ?",
             (mode, account, *params, int(limit)))
 
+    # ------------------------------------------------------------------ lake 사후 대조용 내보내기 (수신 원장 / 주문·체결 / 인증 뒤 거부 로그)
+    @staticmethod
+    def _conds(conds: list[tuple[str, object]]) -> tuple[str, list]:
+        """[(sql fragment with ?, value)] → (' WHERE a AND b', params); value None 인 항목은 생략."""
+        parts = [c for c, v in conds if v is not None]
+        params = [v for _, v in conds if v is not None]
+        return (" WHERE " + " AND ".join(parts)) if parts else "", params
+
+    def export_receipts(self, mode: str | None = None, since_ms: int | None = None, until_ms: int | None = None,
+                        limit: int = 100000) -> list[dict]:
+        """수신 원장: 서명 통과 후 접수된 신호 1행 = event_id 1개 (본문 sha256, 판정/사유, 처리 시각, 같은 ID 중복·충돌 재전달 횟수)."""
+        where, params = self._conds([("s.mode=?", mode), ("s.received_at_ms>=?", since_ms), ("s.received_at_ms<?", until_ms)])
+        return self._q(
+            "SELECT s.received_at_ms, s.mode, s.event_id, s.position_id, s.event_sequence, s.strategy, s.action, s.leg, s.position_idx, "
+            "s.qty_btc, s.body_sha256, s.status AS signal_status, s.reason_code AS signal_reason, s.processed_at_ms, s.note AS signal_note, "
+            "(SELECT COUNT(*) FROM ingress_log i WHERE i.event_id=s.event_id AND i.code='DUPLICATE') AS duplicate_count, "
+            "(SELECT COUNT(*) FROM ingress_log i WHERE i.event_id=s.event_id AND i.code='EVENT_ID_CONFLICT') AS conflict_count "
+            f"FROM signals s{where} ORDER BY s.received_at_ms, s.event_id LIMIT ?", (*params, int(limit)))
+
+    def export_ingress(self, since_ms: int | None = None, until_ms: int | None = None, limit: int = 100000) -> list[dict]:
+        """서명 통과 뒤 거부/중복 기록 (409/410/400/200-duplicate). 서명 전 거부(401 등) 는 DB 에 없다 — Caddy 접속 로그로."""
+        where, params = self._conds([("received_at_ms>=?", since_ms), ("received_at_ms<?", until_ms)])
+        rows = self._q(f"SELECT id, received_at_ms, code, event_id, body_sha256, note FROM ingress_log{where} ORDER BY id LIMIT ?",
+                       (*params, int(limit)))
+        for r in rows:
+            note = str(r.get("note") or "")
+            r["http"] = int(note.split("http=", 1)[1].split()[0]) if "http=" in note else None
+        return rows
+
+    def export_fills(self, mode: str | None = None, since_ms: int | None = None, until_ms: int | None = None,
+                     limit: int = 100000) -> list[dict]:
+        """주문·체결 원장: 체결 1행 (event_id → order_link_id/order_id → exec_id), 전략/leg/행동, 수수료는 거래소 히스토리(account_executions) 가 있으면."""
+        where, params = self._conds([("f.mode=?", mode), ("f.exec_time_ms>=?", since_ms), ("f.exec_time_ms<?", until_ms)])
+        return self._q(
+            "SELECT f.mode, f.account, f.event_id, f.position_id, l.strategy, l.leg, l.position_idx, s.action, o.purpose, o.side, "
+            "o.reduce_only, f.order_link_id, f.order_id, o.status AS order_status, o.qty AS order_qty, f.exec_id, f.qty AS exec_qty, "
+            "f.price AS exec_price, f.exec_time_ms, e.fee, e.fee_currency, e.exec_type "
+            "FROM fills f "
+            "LEFT JOIN orders o ON o.account=f.account AND o.order_link_id=f.order_link_id "
+            "LEFT JOIN lots l ON l.mode=f.mode AND l.account=f.account AND l.position_id=f.position_id "
+            "LEFT JOIN signals s ON s.mode=f.mode AND s.event_id=f.event_id "
+            "LEFT JOIN account_executions e ON e.mode=f.mode AND e.account=f.account AND e.exec_id=f.exec_id"
+            f"{where} ORDER BY f.exec_time_ms, f.exec_id LIMIT ?", (*params, int(limit)))
+
     # ------------------------------------------------------------------ 라이브 신호 로그 (signal_log.py 가 쓰고, export/대시보드가 읽는다)
     def append_signal_log(self, row: dict) -> bool:
         """한 행 추가. 같은 (mode, event_id) 가 이미 있으면 False (재전송/중복 접수는 첫 기록만 남긴다)."""

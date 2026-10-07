@@ -1217,7 +1217,11 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
                     f"<p>total rows: {store.signal_log_count(mode)} · writer: "
                     f"{_esc(' '.join(f'{k}={v}' for k, v in stats.items() if k not in ('jsonl',)))}</p>"
                     f'<p><a href="{UI_PREFIX}/signal-log.csv?{_esc(dl)}">Download CSV</a> (joined with our runs/fills; '
-                    "columns = signal_log.EXPORT_COLUMNS) · CLI: <code>python -m lake_executor export --format csv</code></p>"
+                    "columns = signal_log.EXPORT_COLUMNS) · for the lake reconciliation: "
+                    f'<a href="{UI_PREFIX}/signal-log.csv?kind=receipts&{_esc(dl)}">receipts CSV</a> · '
+                    f'<a href="{UI_PREFIX}/signal-log.csv?kind=fills&{_esc(dl)}">fills CSV</a> · '
+                    f'<a href="{UI_PREFIX}/signal-log.csv?kind=ingress&{_esc(dl)}">ingress CSV</a>'
+                    " · CLI: <code>python -m lake_executor export --kind receipts|fills|ingress --format jsonl</code></p>"
                     + filters + table + _pager(f"{UI_PREFIX}/signal-log", q, limit, offset, has_more))
             return _html(200, _page("Signal log", body, active=f"{UI_PREFIX}/signal-log", session=session))
         return _run(_impl, session)
@@ -1230,11 +1234,12 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
         session = g
 
         def _impl() -> Response:
-            from .signal_log import rows_to_csv
+            from .signal_log import EXPORT_KINDS, dicts_to_csv, export_rows
             mode, since, until = _signal_log_filters(request)
-            rows = store.export_signal_rows(mode, since, until, limit=50000)
-            text = rows_to_csv(rows)
-            name = f"signal_log_{mode or 'all'}_{now_ms()}.csv"
+            kind = _filter(request, "kind", tuple(EXPORT_KINDS)) or "signals"
+            rows, columns = export_rows(store, kind, mode, since, until, limit=50000)
+            text = dicts_to_csv(rows, columns)
+            name = f"{'signal_log' if kind == 'signals' else kind}_{mode or 'all'}_{now_ms()}.csv"
             resp = Response(content=text, media_type="text/csv; charset=utf-8",
                             headers={"Content-Disposition": f'attachment; filename="{name}"'})
             return _with_headers(resp)

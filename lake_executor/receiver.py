@@ -475,11 +475,11 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
         if result == "new":
             log.info("signal accepted mode=%s event_id=%s position_id=%s seq=%s action=%s",
                      sig.mode.value, sig.event_id, sig.position_id, sig.event_sequence, sig.action.value)
-            return _json(202, {"accepted": True, "event_id": sig.event_id})
+            return _json(202, {"accepted": True, "duplicate": False, "mode": sig.mode.value, "event_id": sig.event_id})
         if result == "duplicate":
             _log_ingress("DUPLICATE", sig.event_id, raw, 200)   # 서명 통과 뒤이므로 DB 기록 (대시보드 추적용)
             log.info("signal duplicate mode=%s event_id=%s", sig.mode.value, sig.event_id)
-            return _json(200, {"accepted": True, "duplicate": True})
+            return _json(200, {"accepted": True, "duplicate": True, "mode": sig.mode.value, "event_id": sig.event_id})
         code = "EVENT_ID_CONFLICT" if result == "conflict" else "SEQUENCE_CONFLICT"
         _log_ingress(code, sig.event_id, raw, 409)
         log.warning("signal conflict code=%s mode=%s event_id=%s position_id=%s seq=%s",

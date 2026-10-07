@@ -99,9 +99,10 @@ class Signal(BaseModel):
     strategy: Strategy
     mode: Mode
     event_id: str = Field(pattern=ID_PATTERN)
-    event_sequence: int = Field(ge=1, le=9007199254740991)
-    ts: int = Field(ge=1, le=9007199254740991)
-    expires_at_ms: int = Field(ge=1, le=9007199254740991)
+    # 정수 필드는 strict: "123"(문자열)·true(불리언) 는 거부 (계약: 숫자는 문자열이 아니며 boolean 을 받지 않는다)
+    event_sequence: int = Field(ge=1, le=9007199254740991, strict=True)
+    ts: int = Field(ge=1, le=9007199254740991, strict=True)
+    expires_at_ms: int = Field(ge=1, le=9007199254740991, strict=True)
     exchange: Literal["Bybit", "OKX", "Toobit"]      # lake 는 현재 Bybit 만 보냄; by_exchange 라우팅은 대소문자 무시
     category: Literal["linear"]
     symbol: str = Field(min_length=1, max_length=32)
@@ -112,7 +113,7 @@ class Signal(BaseModel):
     qty_btc: float | None = None
     expected_qty_btc_after: float | None = None
     reference_price: float | None = None
-    protection_revision: int = Field(ge=0, le=9007199254740991)
+    protection_revision: int = Field(ge=0, le=9007199254740991, strict=True)
     stop_loss: float | None = None
     take_profit: list[float] | float | None = None
 

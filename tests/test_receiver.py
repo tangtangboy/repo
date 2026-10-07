@@ -45,7 +45,7 @@ def test_new_signal_is_202_and_persisted(client, store):
     d = make_signal()
     r = _post(client, d)
     assert r.status_code == 202, r.text
-    assert r.json() == {"accepted": True, "event_id": d["event_id"]}
+    assert r.json() == {"accepted": True, "duplicate": False, "mode": "test", "event_id": d["event_id"]}
     row = store.get_signal(d["event_id"])
     assert row is not None
     assert row["status"] == "accepted"
@@ -61,7 +61,7 @@ def test_exact_duplicate_is_200_and_not_executed_twice(client, store, executor):
     r2 = client.post(SIGNAL_PATH, content=raw, headers=headers)
     assert r1.status_code == 202
     assert r2.status_code == 200
-    assert r2.json() == {"accepted": True, "duplicate": True}
+    assert r2.json() == {"accepted": True, "duplicate": True, "mode": "test", "event_id": d["event_id"]}
     # 접수 레코드는 하나, 실행기는 한 번만 처리한다
     assert executor.run_once() is True
     assert executor.run_once() is False

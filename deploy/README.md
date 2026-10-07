@@ -149,6 +149,65 @@ python deploy/finalize.py
 - lake 측에 전달할 것: **signal URL** `https://<PUBLIC_HOST>/lake/signal`, TEST/LIVE 수신 시크릿, 우리 회신 서명 시크릿.
   lake 가 보낸 신호를 재현해 보려면 로컬에서 `python -m lake_executor sign --file signal.json --mode test` 로 헤더를 만들어 curl.
 
+## 5a. GitHub 자동 배포 — 서버가 pull (pem 없이 코드 반영)
+
+> **현재 상태: 준비 중.** `deploy/self_update.sh` 와 `.timer`/`.path` 유닛 파일은 저장소에 있지만, 서버 설치 단계(`setup-server.sh` 의
+> 유닛 생성·활성화), `push.py --repo-url/--deploy-branch` 연동, 대시보드 **Deploy from GitHub now** 버튼은 아직 적용되지 않았다.
+> 그 전까지 코드 반영은 §5 `finalize.py --keep-remote-env --keep-remote-config` 로 한다.
+
+`push.py` 가 처음 한 번 설치해 두면 그 뒤 **코드 반영은 `git push` 만으로 끝난다**. 어느 PC·클라우드 세션에서든 GitHub 에
+푸시만 하면 되고, pem 파일은 `.env`/`config.json` 업로드(`finalize.py`)와 SSH 점검에만 필요하다. 서버의 systemd 유닛 세 개가 일한다.
+
+| 유닛 | 역할 |
+|---|---|
+| `lake-executor-update.timer` | 2분마다(부팅 2분 뒤부터, ±20초) `lake-executor-update.service` 실행 |
+| `lake-executor-update.path` | `state/DEPLOY_NOW` 가 생기면 즉시 실행 — 대시보드 Controls → **Deploy from GitHub now** 가 이 파일을 만든다 |
+| `lake-executor-update.service` | `deploy/self_update.sh` 를 `/run` 에 복사해 실행 (oneshot, `ubuntu`). 유닛 본문은 `setup-server.sh` 가 생성 |
+
+`self_update.sh` 절차: `git fetch` → 추적 브랜치(`DEPLOY_BRANCH`; 비우면 **GitHub 의 기본 브랜치**)의 머리가 HEAD 와 다르면
+`git reset --hard` → `requirements.txt` 가 바뀌었으면 pip → `compileall` → **pytest**(`DEPLOY_RUN_TESTS=1`, 처음 한 번 pytest 설치)
+→ `python -m lake_executor check` → `deploy/*` 가 바뀌었으면 `setup-server.sh` 재실행 → `systemctl restart lake-executor`
+→ 30초 안에 `/healthz` 확인. **어느 단계든 실패하면 직전 커밋으로 되돌리고 서비스를 다시 올린 뒤** `state/last_deploy.json` 에
+`failed`/`rolled_back` 으로 남기고 `.env` 에 텔레그램이 있으면 알린다. `.env`·`config.json`·`state/`·`.venv` 는 git 이 무시하므로
+건드리지 않는다. 처음 실행 때 SFTP 사본 디렉터리를 git 체크아웃으로 바꾼다(bootstrap). 같은 커밋이면 아무것도 하지 않는다(`noop`).
+
+설정은 `/etc/lake-executor/deploy.env` (`setup-server.sh` 가 쓴다; `push.py --repo-url/--deploy-branch` 로 지정, 기본값은 로컬 체크아웃의 `origin`):
+```
+DEPLOY_REPO_URL=https://github.com/<owner>/<repo>.git
+DEPLOY_BRANCH=            # 비우면 GitHub 기본 브랜치를 따라간다
+DEPLOY_RUN_TESTS=1        # 0 이면 pytest 생략 (권장하지 않음)
+DEPLOY_ENABLED=1          # 0 이면 아무것도 하지 않음 (push.py --no-auto-deploy)
+```
+자주 쓰는 명령:
+```powershell
+python deploy/ssh_run.py "systemctl list-timers lake-executor-update.timer --no-pager"
+python deploy/ssh_run.py "journalctl -u lake-executor-update -n 60 --no-pager"        # 배포 로그
+python deploy/ssh_run.py "cat /home/ubuntu/lake-executor/state/last_deploy.json"       # 마지막 결과 (대시보드와 같은 내용)
+python deploy/ssh_run.py "sudo systemctl start lake-executor-update"                   # 지금 바로 (대시보드 버튼과 같음)
+python deploy/ssh_run.py "cd /home/ubuntu/lake-executor && git log --oneline -3"       # 서버가 돌리는 커밋
+python deploy/ssh_run.py "sudo systemctl disable --now lake-executor-update.timer lake-executor-update.path"   # 끄기
+```
+- 비공개 저장소로 바꾸면 `DEPLOY_REPO_URL` 에 읽기 전용 토큰 URL(`https://<token>@github.com/...`) 또는 deploy key(ssh URL +
+  `~ubuntu/.ssh`)를 넣는다. 파일 권한은 `640 root:ubuntu` 다.
+- 보안: **GitHub 에 push 할 수 있는 사람 = 서버에서 코드를 실행할 수 있는 사람**이다(서비스는 `ubuntu`, 비밀번호 없는 sudo).
+  GitHub 계정 2FA 와 기본 브랜치 보호를 켜 둔다.
+- `finalize.py` 로 소스를 다시 올리면 다음 pull 때 `reset --hard` 로 덮인다 — 코드는 git 으로만, `finalize.py` 는
+  `.env`/`config.json` 업로드(`--keep-remote-*` 주의)에만 쓴다.
+
+## 5b. 원장을 Postgres(Supabase) 로 — `DATABASE_URL`
+
+기본 원장은 서버 디스크의 `state/lake.db` 다. 인스턴스가 사라지면 원장도 사라지므로 운영에서는 Postgres 를 권장한다.
+
+1. Supabase 프로젝트(서버와 같은 리전 권장) 의 **Session pooler** 연결 문자열을 받는다: `postgresql://postgres.<ref>:<pw>@aws-1-<region>.pooler.supabase.com:5432/postgres`
+   (`?pgbouncer=true` 같은 쿼리 파라미터는 떼고, 포트는 5432).
+2. `.env` 에 `DATABASE_URL=…` 한 줄 추가 (대시보드 Secrets 페이지에서도 넣을 수 있다; 저장 → Apply & restart). 스키마 이름은 `config.json` 의
+   `database.schema`(기본 `lake_executor`) — 같은 프로젝트의 다른 앱 테이블과 격리된다. 테이블은 기동 때 자동 생성.
+3. `pip install -r requirements.txt` 가 `psycopg[binary]` 를 넣었는지 확인하고(처음 한 번: `ssh_run.py "cd /home/ubuntu/lake-executor && ./.venv/bin/pip install -r requirements.txt"`),
+   `python -m lake_executor check` 로 `ledger : postgres host:5432/postgres schema=… round-trip N ms` 를 본 뒤 `finalize.py --keep-remote-config` (또는 대시보드 재시작).
+4. 열린 lot/pending 회신이 없는 때 전환한다. 기존 SQLite 행은 옮기지 않으며 회신 sequence 는 1부터 다시 시작한다 (lake 에 미리 알린다).
+
+왕복이 500ms 를 넘으면 `check` 가 경고한다 — 서버(서울) 와 다른 리전의 DB 는 신호 하나에 수십 쿼리라 수 초가 걸릴 수 있다. 되돌리려면 `DATABASE_URL` 을 비우고 재시작.
+
 ## 6. 운영 명령 — `ssh_run.py`
 
 ```powershell

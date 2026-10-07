@@ -266,6 +266,14 @@ def _json(status: int, body: dict) -> JSONResponse:
     return JSONResponse(status_code=status, content=body)
 
 
+def _expired_actions_execute(settings: Any) -> set[str]:
+    """만료 뒤에도 접수/실행할 action 집합 (config guards.expired_actions_execute)."""
+    try:
+        return {str(a) for a in (getattr(settings, "expired_actions_execute", None) or ())}
+    except TypeError:
+        return set()
+
+
 def _content_length(request: Request) -> int | None:
     v = request.headers.get("content-length")
     if v is None:
@@ -419,8 +427,9 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
             raise _Reject(400, "INVALID_SIGNAL", "POSITION_MODE_MISMATCH", {"event_id": sig.event_id},
                           authenticated=True)
 
-        # 6) 만료
-        if now_ms() > int(sig.expires_at_ms):
+        # 6) 만료 — guards.expired_actions_execute 에 든 action(기본 partial_exit/full_exit/protection_update) 은
+        #    늦게 도착해도 접수한다 (우리 서버 끊김 동안 lake 가 재전송한 청산/보호가격 변경을 버리지 않는다; 실행기가 stale 로 처리)
+        if now_ms() > int(sig.expires_at_ms) and sig.action.value not in _expired_actions_execute(settings):
             raise _Reject(410, "EXPIRED", "EXPIRED", {"event_id": sig.event_id}, authenticated=True)
         return sig, data
 
@@ -437,6 +446,12 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
         # 7) 영속 접수
         try:
             result = store.insert_signal(sig, raw, now_ms())
+        except st.LedgerUnavailable as e:
+            # 원장(Postgres) 불통: 접수하지 못했으니 503 + Retry-After — lake 는 재전송한다 (2xx 가 아니므로 접수된 게 아님)
+            log.error("insert_signal: ledger unavailable (%s)", e)
+            resp = _json(503, {"error": "LEDGER_UNAVAILABLE", "code": "LEDGER_UNAVAILABLE"})
+            resp.headers["Retry-After"] = "5"
+            return resp
         except Exception as e:  # noqa: BLE001 - DB 장애: 상대는 재전송해야 하므로 5xx
             log.error("insert_signal failed: %s", type(e).__name__)
             return _json(500, {"error": "INTERNAL", "code": "STORE_ERROR"})

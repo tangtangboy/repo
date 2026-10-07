@@ -161,3 +161,20 @@ class Reporter:
 - `close` 류 신호를 **심볼 전량 청산으로 확대하지 않는다**(lot 잔량만).
 - 과거/재전송 신호를 새 매매로 처리하지 않는다(event_id 영속, sequence 검증).
 - 대시보드(`/ui`)는 시크릿 값을 절대 렌더링하지 않는다(마스킹만). 새 값의 적용 경로는 재시작뿐이며, 대시보드는 신호를 만들거나 주문을 내지 않는다.
+
+## 11. 원장 백엔드 (store.py: SQLite | Postgres) 와 끊김 뒤 복구
+
+- `Store(path_or_url, schema=…)`: `postgres://`/`postgresql://` 면 Postgres(psycopg3, autocommit 연결에 BEGIN/COMMIT 을 SQL 로 보냄), 아니면 SQLite 파일.
+  SQL 은 SQLite 문법 하나로 쓰고 `translate_pg` 가 실행 직전에 바꾼다 (`?`→`%s`, `INSERT OR IGNORE`→`ON CONFLICT DO NOTHING`, `BEGIN IMMEDIATE`→`BEGIN`,
+  DDL 타입). 방언이 갈리는 두 곳(rowid 정렬, bytea 포함 검색)만 `Store` 가 백엔드별 문장을 고른다. `INSERT OR REPLACE` 는 쓰지 않는다 (`ON CONFLICT … DO UPDATE`).
+- Postgres 는 전용 스키마(`config.json` `database.schema`, 기본 `lake_executor`) 에 테이블을 만들고 세션마다 `SET search_path` — **Supabase 세션 풀러(5432) 전용**,
+  트랜잭션 풀러(6543) 와 쿼리 파라미터가 붙은 URL 은 `config.validate_database` 가 거부한다. 1단계→2 마이그레이션은 SQLite 에만 있다(Postgres 는 항상 새 스키마).
+- 연결 단절: 트랜잭션 **밖** 문장은 재접속(최대 3회, 0.5s 백오프) 후 한 번 재시도, 트랜잭션 **안** 이면 `LedgerUnavailable` 을 올리고 `_Tx` 가 조용히 정리한다
+  (서버가 이미 롤백). 수신기는 `insert_signal` 의 `LedgerUnavailable` 을 `503 LEDGER_UNAVAILABLE` + `Retry-After: 5` 로 답한다(2xx 가 아니므로 접수 아님 → lake 재전송).
+  실행기 루프는 1→2→…→30초 백오프, 같은 예외 종류의 알림은 5분에 한 번, 회복 시 "loop recovered" 한 번.
+- 만료 정책 `guards.expired_actions_execute`(기본 partial_exit/full_exit/protection_update): 수신기 6단계와 실행기 `_process_signal` 이 같은 집합을 본다.
+  집합에 든 action 은 `expires_at_ms` 가 지나도 접수·실행하고 `_Ctx.stale` → run note `stale(executed after expires_at_ms) …`. 그 외(entry/add) 는 410/`EXPIRED`.
+  회신 본문은 바꾸지 않는다(계약의 reason_code 집합 유지).
+- 재시작/재연결 뒤 순서: `ensure_account_setup` → `recover_processing`(processing 신호는 재실행 없이 거래소 주문 조회로 마무리) → accepted 신호 FIFO(만료 정책 적용)
+  → 스냅샷 루프의 `reconcile` 이 lot 과 거래소 포지션을 대조, pending 회신은 같은 바이트로 이어서 전송. 원장이 Postgres 면 **다른 서버** 에서 같은 절차로 이어받을 수 있다.
+- `check`: `DATABASE_URL` 이 있으면 실제 접속해 `ledger : postgres host:port/db schema=… round-trip N ms` 를 출력한다 (500ms 초과 경고). 대시보드 Overview `ledger` 행도 같은 정보.

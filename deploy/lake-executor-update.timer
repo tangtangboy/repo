@@ -1,0 +1,13 @@
+[Unit]
+Description=poll GitHub for lake-executor updates (every 2 min)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=20s
+AccuracySec=10s
+Persistent=true
+Unit=lake-executor-update.service
+
+[Install]
+WantedBy=timers.target

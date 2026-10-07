@@ -306,6 +306,7 @@ def allowed_env_keys(settings: Any) -> dict[str, KeySpec]:
         out[f"{p}_API_SECRET"] = KeySpec("account", acct.name, True, 0)
         if acct.exchange == "okx":
             out[f"{p}_API_PASSPHRASE"] = KeySpec("account", acct.name, True, 0)
+    out["DATABASE_URL"] = KeySpec("database", None, True, 0)   # postgres://… (비밀번호 포함) — 비우면 SQLite
     return out
 
 
@@ -340,6 +341,7 @@ def in_process_env(settings: Any) -> dict[str, str]:
     out["TELEGRAM_BOT_TOKEN"] = sec.telegram_bot_token or ""
     out["TELEGRAM_CHAT_ID"] = sec.telegram_chat_id or ""
     out["ADMIN_TOKEN"] = sec.admin_token or ""
+    out["DATABASE_URL"] = getattr(sec, "database_url", "") or ""
     return out
 
 
@@ -504,6 +506,9 @@ def validate_env_candidate(settings: Any, paths: Any, updates: dict[str, str], e
                 u = None
             if u is None or u.scheme not in ("http", "https") or not u.netloc:
                 raise UiError(400, "INVALID_CANDIDATE", f"{k} must be an absolute http(s) URL")
+        if k == "DATABASE_URL" and v and not v.lower().startswith(("postgres://", "postgresql://")):
+            # 자세한 검사는 config.validate_database (아래 config.load) — 값은 메시지에 넣지 않는다
+            raise UiError(400, "INVALID_CANDIDATE", "DATABASE_URL must start with postgres:// (empty = SQLite)")
     try:
         cand = config_mod.load(paths.config, paths.env, env_override=dict(updates))
     except (config_mod.ConfigError, ValueError, TypeError) as e:
@@ -843,6 +848,19 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
         state = "ok" if res.get("ok") else ("skipped" if res.get("ok") is None else "fail")
         return _Raw(f"{_status(state)} {_esc(_fmt_ms(res.get('at_ms')))}")
 
+    def _ledger_summary() -> Any:
+        """원장 백엔드(sqlite 경로 / postgres host — 비밀번호 없음) + 왕복 시간 + 재접속 횟수."""
+        desc = getattr(store, "describe", None)
+        text = desc() if callable(desc) else "sqlite"
+        try:
+            ping = getattr(store, "ping_ms", None)
+            rtt = f" rtt {ping():.0f} ms" if callable(ping) else ""
+            state = "ok"
+        except Exception as e:  # noqa: BLE001
+            rtt, state = f" UNAVAILABLE ({type(e).__name__})", "fail"
+        rec = int(getattr(store, "reconnects", 0) or 0)
+        return _Raw(f"{_status(state)} {_esc(text)}{_esc(rtt)}" + (f" reconnects={rec}" if rec else ""))
+
     @app.get(UI_PREFIX)
     def ui_overview(request: Request):
         g = _gate(request)
@@ -879,6 +897,8 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
             ("ingress_rejections (pre-auth counters)", " ".join(f"{k}={v}" for k, v in sorted(rejections.items())) or "0"),
             ("process started", f"{_fmt_ms(started_ms)} (uptime {_fmt_uptime(now_ms() - started_ms)})"),
             ("pending restart", (",".join(pend["keys"]) + " — restart required") if pend else "no"),
+            ("ledger", _ledger_summary()),
+            ("expired actions still executed", ", ".join(getattr(settings, "expired_actions_execute", None) or []) or "none"),
             ("editing", (f"env={paths.env} config={paths.config}" if paths
                          else "editing disabled (serve was not started with known --env/--config)")),
         ]

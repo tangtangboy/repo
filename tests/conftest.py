@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import uuid
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -197,11 +198,29 @@ class AlertsStub:
         return any(needle in m for m in self.messages)
 
 
+def _open_store(path: str) -> Store:
+    """기본은 SQLite. LAKE_TEST_DATABASE_URL 이 있으면 같은 테스트를 Postgres(임시 스키마) 로 돌린다:
+        LAKE_TEST_DATABASE_URL=postgresql://… python -m pytest -q
+    (느리다 — 쿼리마다 왕복. 전체 스위트를 Postgres 로 돌리는 건 백엔드 전환 검증 때만.)"""
+    url = os.environ.get("LAKE_TEST_DATABASE_URL", "").strip()
+    if not url:
+        return Store(path)
+    return Store(url, schema="lake_test_" + uuid.uuid4().hex[:10])
+
+
+def _close_store(s: Store) -> None:
+    try:
+        if getattr(s, "backend", "sqlite") == "postgres":
+            s._conn.execute(f'DROP SCHEMA IF EXISTS "{s.schema}" CASCADE')
+    finally:
+        s.close()
+
+
 @pytest.fixture
 def store(settings):
-    s = Store(settings.db_path)
+    s = _open_store(settings.db_path)
     yield s
-    s.close()
+    _close_store(s)
 
 
 @pytest.fixture
@@ -220,9 +239,9 @@ def paper_exchanges(settings, paper):
 
 @pytest.fixture
 def multi_store(multi_settings):
-    s = Store(multi_settings.db_path)
+    s = _open_store(multi_settings.db_path)
     yield s
-    s.close()
+    _close_store(s)
 
 
 @pytest.fixture

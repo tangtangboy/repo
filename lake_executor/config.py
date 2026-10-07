@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 
 from .util import env_suffix, parse_env_file, read_json
@@ -44,6 +45,7 @@ class Secrets:
     admin_token: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    database_url: str = ""                               # 비어 있으면 SQLite(state/lake.db); postgres://… 면 Postgres(Supabase)
 
     def has_real_bybit_keys(self) -> bool:
         return _real_keys(self.bybit_api_key, self.bybit_api_secret)
@@ -138,12 +140,27 @@ class Settings:
     routing: str = "fanout"               # fanout | by_exchange
     accounts: list = field(default_factory=list)   # list[AccountSettings]
 
+    db_schema: str = "lake_executor"      # Postgres 원장 스키마 (DATABASE_URL 이 있을 때만)
+    # 만료(expires_at_ms 경과) 뒤 도착/처리되는 신호 중 그래도 실행할 action. 진입류(entry/add) 는 절대 넣지 않는 것을 권장:
+    # 오래된 가격으로 새 포지션을 열면 안 되지만, 청산/보호가격 변경은 늦게라도 적용하는 편이 안전하다 (서버 끊김 뒤 재연결 복구).
+    expired_actions_execute: list = field(default_factory=lambda: ["partial_exit", "full_exit", "protection_update"])
+
     secrets: Secrets = field(default_factory=Secrets)
 
     # ---- 파생 ----
     @property
     def db_path(self) -> str:
         return os.path.join(self.state_dir, "lake.db")
+
+    @property
+    def db_url(self) -> str:
+        """DATABASE_URL (.env). 비어 있으면 SQLite."""
+        return str(getattr(self.secrets, "database_url", "") or "").strip()
+
+    @property
+    def ledger_target(self) -> str:
+        """Store() 에 넘길 대상: Postgres URL 또는 SQLite 경로."""
+        return self.db_url or self.db_path
 
     @property
     def halt_file(self) -> str:
@@ -312,6 +329,12 @@ def load(config_path: str = "config.json", env_path: str = ".env", env_override:
     s.state_dir = str(_get(cfg, "state_dir", s.state_dir))
     s.log_file = str(_get(cfg, "log_file", s.log_file) or "")
     s.routing = str(_get(cfg, "routing", s.routing))
+    s.db_schema = str(_get(cfg, "database.schema", s.db_schema) or "lake_executor")
+    eae = _get(cfg, "guards.expired_actions_execute", None)
+    if eae is not None:
+        if not isinstance(eae, list) or not all(isinstance(x, str) for x in eae):
+            raise ConfigError("guards.expired_actions_execute must be a list of action names")
+        s.expired_actions_execute = [str(x) for x in eae]
 
     sec = Secrets()
     sec.bybit_api_key = env.get("BYBIT_API_KEY", "")
@@ -330,6 +353,7 @@ def load(config_path: str = "config.json", env_path: str = ".env", env_override:
     sec.admin_token = env.get("ADMIN_TOKEN", "")
     sec.telegram_bot_token = env.get("TELEGRAM_BOT_TOKEN", "")
     sec.telegram_chat_id = env.get("TELEGRAM_CHAT_ID", "")
+    sec.database_url = env.get("DATABASE_URL", "").strip()
     s.secrets = sec
 
     raw_accounts = _get(cfg, "accounts", None)
@@ -348,8 +372,38 @@ def load(config_path: str = "config.json", env_path: str = ".env", env_override:
         first = s.accounts[0]
         s.symbol, s.position_mode, s.leverage = first.symbol, first.position_mode, first.leverage
         s.margin_mode, s.testnet = first.margin_mode, first.testnet
+    validate_database(s)
     validate(s)
     return s
+
+
+_SCHEMA_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+_KNOWN_ACTIONS = ("entry", "add", "partial_exit", "full_exit", "protection_update")
+
+
+def validate_database(s: Settings) -> None:
+    """DATABASE_URL / database.schema / guards.expired_actions_execute 검증 (값은 메시지에 넣지 않는다)."""
+    if not _SCHEMA_RE.match(s.db_schema or ""):
+        raise ConfigError("database.schema must match [a-z_][a-z0-9_]{0,62}")
+    bad = [a for a in s.expired_actions_execute if a not in _KNOWN_ACTIONS]
+    if bad:
+        raise ConfigError(f"guards.expired_actions_execute has unknown actions: {bad}")
+    url = s.db_url
+    if not url:
+        return
+    if not url.lower().startswith(("postgres://", "postgresql://")):
+        raise ConfigError("DATABASE_URL must start with postgres:// or postgresql:// (leave empty for SQLite)")
+    try:
+        u = urllib.parse.urlsplit(url)
+        host, port = (u.hostname or ""), u.port
+    except ValueError:
+        raise ConfigError("DATABASE_URL is not a valid URL") from None
+    if not host:
+        raise ConfigError("DATABASE_URL has no host")
+    if u.query:
+        raise ConfigError("DATABASE_URL must not carry query parameters (e.g. ?pgbouncer=true); use the plain session-pooler URL")
+    if host.endswith("pooler.supabase.com") and port == 6543:
+        raise ConfigError("DATABASE_URL uses the Supabase transaction pooler (6543); use the session pooler port 5432")
 
 
 def validate_account(a: AccountSettings) -> None:

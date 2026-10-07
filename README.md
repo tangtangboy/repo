@@ -179,6 +179,25 @@ AWS EC2(서울) + Elastic IP + Caddy(자동 HTTPS 443) → `127.0.0.1:8787` lake
 모든 거래소 API 키는 Elastic IP 로 IP 제한하므로 로컬에서 `check` 가 거래소 단계에서 실패하는 것이 정상이다.
 계정 추가 절차(키 권한, OKX passphrase·데모, Toobit 양방향 포지션)는 `docs/RUNBOOK.md` §6.
 
+## 원장 DB (SQLite 또는 Postgres/Supabase)
+
+원장(신호·실행·lot·주문·체결·회신·meta)은 `.env` 의 **`DATABASE_URL`** 이 비어 있으면 서버 디스크의 `state/lake.db`(SQLite),
+`postgres://…` 면 그 Postgres 의 전용 스키마(`config.json` `database.schema`, 기본 `lake_executor`) 에 산다. 같은 코드·같은 SQL 이고
+`store.py` 가 실행 직전에 방언만 바꾼다. Supabase 는 **세션 풀러 주소(포트 5432, 쿼리 파라미터 없음)** 를 쓴다 — 트랜잭션 풀러(6543) 는
+`search_path` 가 유지되지 않아 설정 단계에서 거부된다. `python -m lake_executor check` 가 실제로 접속해 왕복 시간과 원장 계정을 보여 준다.
+
+왜 Postgres 인가: 서버가 죽거나 교체돼도 원장이 남아 **새 서버가 같은 lot·회신 순번에서 이어서** 처리한다. SQLite 는 EC2 디스크에만 있어
+인스턴스가 사라지면 원장도 사라진다. 전환은 `.env` 한 줄(+ 재시작)이고 되돌리기도 같다. 기존 SQLite 행은 자동으로 옮기지 않는다
+(열린 lot 이 없을 때 전환할 것; 회신 sequence 는 새 원장에서 1부터).
+
+**끊김 뒤 재연결 복구.** 원장(Postgres) 에 닿지 않으면 수신기는 `503 LEDGER_UNAVAILABLE` + `Retry-After` 로 답해 lake 가 재전송하게 하고
+(2xx 가 아니므로 접수된 것이 아니다), 실행기는 1→30초 백오프로 재시도하며 같은 오류 알림은 5분에 한 번만 보낸다. 트랜잭션 밖 문장은
+재접속 후 한 번 재시도한다. 재시작 뒤의 복구(processing 신호, pending 회신, 보호주문 대사)는 `docs/RUNBOOK.md` §8.
+**만료 정책** `guards.expired_actions_execute`(기본 `partial_exit`, `full_exit`, `protection_update`): 끊김 동안 밀렸다가 늦게 도착/처리되는
+신호 중 이 action 들은 `expires_at_ms` 가 지났어도 접수·실행하고 run note 에 `stale(...)` 로 남긴다. `entry`/`add` 는 절대 늦게 실행하지
+않는다(`EXPIRED` 거부) — 오래된 가격으로 새 포지션을 여는 것보다 청산·보호가격 변경을 버리는 쪽이 더 위험하기 때문이다. 빈 리스트로 두면
+예전처럼 전부 거부한다.
+
 ## 운영 대시보드 (/ui)
 
 서버에 올린 뒤 브라우저로 **`https://<PUBLIC_HOST>/ui`** 를 열면 SSH 나 `.env` 편집 없이 운영할 수 있다. 로그인은 `.env` 의 `ADMIN_TOKEN`

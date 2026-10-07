@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 새 Ubuntu 24.04 EC2 에서 1회 실행 (push.py 가 호출). 멱등: 다시 돌려도 안전.
-#   bash deploy/setup-server.sh [PUBLIC_HOST] [ADMIN_ALLOW_CIDR] [UI_ALLOW_CIDR]
+#   bash deploy/setup-server.sh [PUBLIC_HOST] [ADMIN_ALLOW_CIDR] [UI_ALLOW_CIDR] [DEPLOY_REPO_URL] [DEPLOY_BRANCH]
 # PUBLIC_HOST 우선순위: 인자 > 환경변수 PUBLIC_HOST > 기존 /etc/caddy/env > <EIP를 -로 바꾼 값>.sslip.io
 # ADMIN_ALLOW_CIDR: /state, /admin/* 를 외부에서 허용할 운영자 CIDR (기본 127.0.0.1/32 = 외부 차단, 서버 로컬만)
 # UI_ALLOW_CIDR: 운영 대시보드 /ui 를 허용할 CIDR (기본 "0.0.0.0/0 ::/0" = IPv4/IPv6 어디서나; 로그인(ADMIN_TOKEN) 이 보호한다;
@@ -60,7 +60,7 @@ echo ">> UI_ALLOW_CIDR=$UI_ALLOW_CIDR (/ui dashboard reachable from here; ADMIN_
 # ---------- 1) python ----------
 echo ">> apt: python venv + base tools"
 sudo apt-get update -y -q
-sudo apt-get install -y -q python3-venv python3-pip curl ca-certificates gnupg \
+sudo apt-get install -y -q python3-venv python3-pip git curl ca-certificates gnupg \
   debian-keyring debian-archive-keyring apt-transport-https
 
 if [ ! -x .venv/bin/python ]; then

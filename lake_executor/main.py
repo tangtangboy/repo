@@ -155,8 +155,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
              settings.routing, [f"{a.name}({a.exchange}{'' if a.enabled else ',disabled'})" for a in settings.accounts],
              settings.listen_host, settings.listen_port, settings.signal_path)
 
-    # 1단계 DB 라면 기존 행은 settings.legacy_account_name()(첫 bybit 계정) 으로 귀속된다
-    store = Store(settings.db_path, legacy_account=settings.legacy_account_name())
+    # 1단계 DB 라면 기존 행은 settings.legacy_account_name()(첫 bybit 계정) 으로 귀속된다.
+    # DATABASE_URL 이 있으면 Postgres(Supabase) 원장, 없으면 state/lake.db
+    try:
+        store = Store(settings.ledger_target, legacy_account=settings.legacy_account_name(), schema=settings.db_schema)
+    except Exception as e:  # noqa: BLE001 - 원장 불통/설정 오류는 기동 거부 (systemd 가 5초 뒤 재시도)
+        log.error("ledger open failed (%s): %s", "DATABASE_URL" if settings.db_url else settings.ledger_target,
+                  type(e).__name__)
+        raise config.ConfigError(f"ledger open failed: {type(e).__name__}") from e
+    log.info("ledger: %s", store.describe())
     try:
         verify_ledger_accounts(settings, store)   # 설정에 없는 계정의 open lot/pending 회신 → ConfigError (exit 2)
     except config.ConfigError:
@@ -330,6 +337,37 @@ def _check_account(acct, ex_factory) -> int:
 
 
 def _check_ledger(settings) -> int:
+    """원장 점검. DATABASE_URL 이 있으면 Postgres 에 실제로 접속해 왕복 시간과 원장 계정을 출력하고, 없으면 SQLite 파일을 읽는다."""
+    if not settings.db_url:
+        return _check_ledger_sqlite(settings)
+    from .store import Store, describe_target
+    try:
+        store = Store(settings.ledger_target, legacy_account=settings.legacy_account_name(), schema=settings.db_schema)
+    except Exception as e:  # noqa: BLE001
+        print(f"ledger            : {describe_target(settings.db_url)} schema={settings.db_schema}  CONNECT FAILED ({type(e).__name__})")
+        return 1
+    try:
+        rtt = store.ping_ms()
+        print(f"ledger            : {store.describe()}  round-trip {rtt:.0f} ms  schema_version={store.get_meta('schema_version')}")
+        if rtt > 500:
+            print("ledger            : WARNING round-trip > 500 ms — use a Postgres in the same region as the server")
+        known = {a.name for a in settings.accounts}
+        problems = 0
+        for account, info in store.ledger_accounts().items():
+            flag = "" if account in known else ("  ← NOT IN config accounts" + (" (open lots!)" if info["open_lots"] else ""))
+            print(f"ledger            : account {account!r} open_lots={info['open_lots']} "
+                  f"pending_reports={info['pending_reports']} rows={info['rows']}{flag}")
+            if account not in known and info["open_lots"]:
+                problems += 1
+        return problems
+    except Exception as e:  # noqa: BLE001
+        print(f"ledger            : query failed ({type(e).__name__})")
+        return 1
+    finally:
+        store.close()
+
+
+def _check_ledger_sqlite(settings) -> int:
     """DB 가 있으면 (마이그레이션 없이, 읽기 전용 sqlite 로) 원장의 계정 이름을 설정과 대조해 출력. 반환: 문제 수.
     1단계 스키마(account 컬럼 없음) 면 어느 계정으로 이전될지(legacy_account_name) 만 알린다 — 마이그레이션은 serve 가 한다."""
     import sqlite3
@@ -377,7 +415,10 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"routing           : {settings.routing}  accounts={len(settings.accounts)} "
           f"(enabled: {[a.name for a in settings.enabled_accounts()]})")
     print(f"listen            : {settings.listen_host}:{settings.listen_port}{settings.signal_path}")
-    print(f"state_dir         : {settings.state_dir}  db={'exists' if os.path.exists(settings.db_path) else 'new'}  HALT={'YES' if halted else 'no'}")
+    db_desc = ("DATABASE_URL (postgres)" if settings.db_url
+               else f"sqlite {'exists' if os.path.exists(settings.db_path) else 'new'}")
+    print(f"state_dir         : {settings.state_dir}  db={db_desc}  HALT={'YES' if halted else 'no'}")
+    print(f"expired policy    : execute after expiry = {settings.expired_actions_execute} (others rejected EXPIRED)")
     print(f"live.enabled      : {settings.live_enabled}  -> live execution possible (any account): {ok_live}{'' if ok_live else ' (' + reason + ')'}")
     print(f"test.simulate     : {settings.test_simulate_fills}")
     for m in MODES:

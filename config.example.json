@@ -64,8 +64,13 @@
     "max_order_qty_btc": 0.05,
     "max_leg_qty_btc": 0.2,
     "max_entry_slippage_pct": 1.5,
-    "protection_trigger_by": "MarkPrice"
+    "protection_trigger_by": "MarkPrice",
+    "_comment_expired": "만료(expires_at_ms) 뒤 도착/처리돼도 실행할 action. 서버 끊김 뒤 재연결 때 청산·보호가격 변경을 버리지 않는다. entry/add 는 넣지 말 것",
+    "expired_actions_execute": ["partial_exit", "full_exit", "protection_update"]
   },
+
+  "_comment_database": "원장 백엔드. .env 의 DATABASE_URL(postgres://…, Supabase 세션 풀러 5432) 이 있으면 Postgres 의 이 스키마에, 없으면 state/lake.db(SQLite)",
+  "database": { "schema": "lake_executor" },
 
   "report": {
     "snapshot_interval_ms": 30000,

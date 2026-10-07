@@ -20,6 +20,10 @@
 | 재개 | `ssh_run.py "rm -f /home/ubuntu/lake-executor/state/HALT"` 또는 `POST /admin/resume` 또는 대시보드 Controls → Resume | 즉시 효력 (재시작 불필요) |
 | 설정 반영 | 로컬에서 `.env`/`config.json` 수정 → `python deploy/finalize.py`, 또는 **대시보드 Accounts/Secrets 에서 저장 → Controls → Apply & restart**(§5) | 업로드(600) → `check` → 재시작 / 서버 파일 직접 갱신 → 재시작 |
 | 재시작 (대시보드) | Controls → **Apply & restart** | SIGTERM → 정상 종료 → systemd 가 5초 뒤 재기동. 기동 60초 뒤부터, 60초 간격, 5분 3회 제한 |
+| **코드 반영** | 지금은 `python deploy/finalize.py --keep-remote-env --keep-remote-config`. (준비 중: `git push` → 서버가 2분 안에 pull, Controls → **Deploy from GitHub now**) | 준비 중인 자동 배포는 pull → compileall·pytest·`check` 통과 시 재시작, 실패 시 직전 커밋으로 롤백 (`deploy/README.md` §5a) |
+| **원장 DB 전환** | `.env` `DATABASE_URL=postgres://…`(Supabase 세션 풀러 5432) → `check` → 재시작 | SQLite(`state/lake.db`) ↔ Postgres. 전환은 열린 lot 없을 때; 회신 sequence 1부터 (`deploy/README.md` §5b) |
+| **원장 불통 (Postgres)** | 자동 | 수신기 `503 LEDGER_UNAVAILABLE`+`Retry-After`(lake 재전송), 실행기 1→30초 백오프·알림 5분 1회, 회복 시 "loop recovered" 알림. Overview `ledger` 행이 `UNAVAILABLE` 로 바뀐다 |
+| **만료 신호 정책** | `config.json` `guards.expired_actions_execute` | 기본 `partial_exit/full_exit/protection_update` 는 `expires_at_ms` 가 지나도 접수·실행(run note `stale`), `entry/add` 는 `EXPIRED` 거부 |
 
 HALT 중 접수된 신호는 202 로 받아들여지지만 실행기에서 즉시 거부 회신된다 — lake 는 그 거부를 보고 판단해야 하므로
 **HALT 걸기 전에 lake 에 알리는 것**이 원칙이다. 정지(`stop`) 중에 lake 가 보낸 신호는 Caddy 502 로 접수되지 않는다

@@ -1,4 +1,13 @@
-"""SQLite 영속 원장. 모든 쓰기는 단일 Lock + BEGIN IMMEDIATE 로 직렬화한다.
+"""영속 원장. SQLite(파일) 또는 Postgres(DATABASE_URL, 예: Supabase) 두 백엔드를 같은 API 로 쓴다.
+모든 쓰기는 단일 Lock + 트랜잭션(BEGIN IMMEDIATE / BEGIN) 으로 직렬화한다.
+
+백엔드 선택: `Store(path_or_url)` — `postgres://` / `postgresql://` 로 시작하면 Postgres(psycopg3), 아니면 SQLite 파일.
+SQL 은 SQLite 문법으로 쓰고 `_PgConn` 이 실행 직전에 변환한다(`translate_pg`): `?`→`%s`, `INSERT OR IGNORE`→`ON CONFLICT DO NOTHING`,
+`BEGIN IMMEDIATE`→`BEGIN`, DDL 타입(INTEGER→BIGINT, REAL→DOUBLE PRECISION, BLOB→BYTEA, AUTOINCREMENT→BIGSERIAL).
+방언이 갈리는 두 곳(rowid 정렬, 바이트열 포함 검색)은 `Store` 가 백엔드별 문장을 고른다.
+Postgres 는 전용 스키마(기본 `lake_executor`) 에 테이블을 만들고 세션마다 `search_path` 를 고정한다 — **세션 풀러(5432) 전용**
+(트랜잭션 풀러 6543 은 SET 이 유지되지 않는다). 연결이 끊기면 트랜잭션 밖 문장은 재접속 후 한 번 재시도하고,
+트랜잭션 안이면 `LedgerUnavailable` 을 올린다 (수신기 → 503, 실행기 → 백오프). 1단계→2 마이그레이션은 SQLite 에만 있다.
 
 스키마 버전 2 (meta `schema_version`) — 계정 단위 원장 (ARCHITECTURE_MULTI_EXCHANGE.md §4).
 
@@ -24,15 +33,175 @@ meta 의 seq/observed/inconsistent 키도 같은 접미사로 옮긴다. 한 트
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import sqlite3
 import threading
+import time
+import urllib.parse
 from typing import Callable
 
 from .util import now_ms, sha256_hex
 
+log = logging.getLogger("lake_executor.store")
+
 SCHEMA_VERSION = 2
 DEFAULT_ACCOUNT = "bybit"   # 1단계 DB 의 모든 행이 속하는 계정
+DEFAULT_PG_SCHEMA = "lake_executor"
+_PG_SCHEMA_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+
+
+class LedgerUnavailable(RuntimeError):
+    """원장 DB(Postgres) 에 닿지 않는다. 수신기는 503(상대가 재전송), 실행기는 백오프 뒤 재시도."""
+
+
+def is_postgres_url(target: str | None) -> bool:
+    return str(target or "").strip().lower().startswith(("postgres://", "postgresql://"))
+
+
+def describe_target(target: str) -> str:
+    """로그/대시보드용 표시 문자열. 비밀번호는 절대 포함하지 않는다."""
+    if not is_postgres_url(target):
+        return f"sqlite {target}"
+    try:
+        u = urllib.parse.urlsplit(target)
+        host = u.hostname or "?"
+        port = u.port or 5432
+        db = (u.path or "/").lstrip("/") or "postgres"
+        return f"postgres {host}:{port}/{db}"
+    except ValueError:
+        return "postgres (unparseable url)"
+
+
+def _pg_ddl(sql: str) -> str:
+    """SQLite DDL → Postgres DDL (타입만 바꾼다)."""
+    sql = re.sub(r"\bINTEGER PRIMARY KEY AUTOINCREMENT\b", "BIGSERIAL PRIMARY KEY", sql)
+    sql = re.sub(r"\bBLOB\b", "BYTEA", sql)
+    sql = re.sub(r"\bREAL\b", "DOUBLE PRECISION", sql)
+    sql = re.sub(r"\bINTEGER\b", "BIGINT", sql)
+    return sql
+
+
+def translate_pg(sql: str, has_params: bool) -> str:
+    """SQLite 문장 → Postgres 문장. 저장소의 SQL 은 SQLite 문법으로 쓰고 실행 직전에만 바꾼다.
+    - BEGIN IMMEDIATE → BEGIN
+    - INSERT OR IGNORE INTO … → INSERT INTO … ON CONFLICT DO NOTHING
+    - CREATE TABLE/INDEX 의 타입 이름
+    - 파라미터가 있으면 '%' → '%%'(LIKE 리터럴 보호) 뒤 '?' → '%s'"""
+    s = sql.strip().rstrip(";")
+    up = s.upper()
+    if up.startswith("BEGIN"):
+        return "BEGIN"
+    if up.startswith("CREATE TABLE") or up.startswith("CREATE INDEX"):
+        return _pg_ddl(s)
+    if up.startswith("INSERT OR IGNORE INTO"):
+        s = "INSERT INTO" + s[len("INSERT OR IGNORE INTO"):] + " ON CONFLICT DO NOTHING"
+    if has_params:
+        s = s.replace("%", "%%").replace("?", "%s")
+    return s
+
+
+class _PgConn:
+    """psycopg 연결을 sqlite3.Connection 처럼 쓰게 하는 얇은 어댑터 (execute / executescript / close).
+    autocommit 연결에 BEGIN/COMMIT/ROLLBACK 을 SQL 로 직접 보내므로 _Tx 가 그대로 동작한다."""
+
+    def __init__(self, url: str, schema: str = DEFAULT_PG_SCHEMA, connect_timeout: int = 15):
+        try:
+            import psycopg  # noqa: F401
+        except ImportError as e:  # pragma: no cover - 배포 환경 의존성
+            raise RuntimeError("DATABASE_URL is set but psycopg is not installed: pip install 'psycopg[binary]'") from e
+        if not _PG_SCHEMA_RE.match(schema or ""):
+            raise ValueError(f"invalid database schema name: {schema!r}")
+        self.url, self.schema, self.timeout = url, schema, int(connect_timeout)
+        self._conn = None
+        self.in_tx = False
+        self.broken = False
+        self.reconnects = 0
+        self._connect(create_schema=True)
+
+    def _connect(self, create_schema: bool = False) -> None:
+        import psycopg
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                conn = psycopg.connect(self.url, autocommit=True, connect_timeout=self.timeout,
+                                       application_name="lake-executor", keepalives=1, keepalives_idle=30,
+                                       keepalives_interval=10, keepalives_count=3)
+                with conn.cursor() as cur:
+                    if create_schema:
+                        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
+                    cur.execute(f'SET search_path TO "{self.schema}"')
+                if getattr(self, "_connected_once", False):
+                    self.reconnects += 1
+                self._connected_once = True
+                self._conn, self.in_tx, self.broken = conn, False, False
+                return
+            except psycopg.Error as e:
+                last = e
+                time.sleep(0.5 * (attempt + 1))
+        raise LedgerUnavailable(f"postgres connect failed: {type(last).__name__}")
+
+    def execute(self, sql: str, params=()):
+        import psycopg
+        params = tuple(params or ())
+        q = translate_pg(sql, bool(params))
+        up = q.upper()
+        for attempt in (0, 1):
+            if self._conn is None or self.broken:
+                if self.in_tx:
+                    self.in_tx = False
+                    raise LedgerUnavailable("postgres connection lost inside a transaction")
+                self._connect()
+            try:
+                cur = self._conn.cursor()
+                cur.execute(q, params or None)
+                if up == "BEGIN":
+                    self.in_tx = True
+                elif up in ("COMMIT", "ROLLBACK"):
+                    self.in_tx = False
+                return cur
+            except (psycopg.OperationalError, psycopg.InterfaceError) as e:
+                self.broken = True
+                try:
+                    self._conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._conn = None
+                log.warning("postgres connection error (%s); %s", type(e).__name__,
+                            "aborting transaction" if self.in_tx else "reconnecting")
+                if self.in_tx or attempt == 1:
+                    self.in_tx = False
+                    raise LedgerUnavailable(f"postgres error: {type(e).__name__}") from e
+        raise LedgerUnavailable("postgres unreachable")  # pragma: no cover
+
+    def executescript(self, script: str) -> None:
+        for stmt in script.split(";"):
+            if stmt.strip():
+                self.execute(stmt)
+
+    def rollback_quiet(self) -> None:
+        """트랜잭션 중 연결이 끊긴 뒤의 ROLLBACK: 끊긴 연결에는 보낼 수 없으므로 상태만 정리한다."""
+        if self.broken or self._conn is None:
+            self.in_tx = False
+            return
+        try:
+            self.execute("ROLLBACK")
+        except LedgerUnavailable:
+            self.in_tx = False
+
+    def ping_ms(self) -> float:
+        t = time.monotonic()
+        self.execute("SELECT 1").fetchone()
+        return (time.monotonic() - t) * 1000.0
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._conn = None
 
 # 테이블별 DDL (마이그레이션이 개별 테이블을 다시 만들 수 있도록 분리)
 TABLES: dict[str, str] = {
@@ -199,26 +368,59 @@ def _loads(v):
 
 
 class Store:
-    def __init__(self, path: str, legacy_account: str | None = None):
-        """legacy_account: 1단계(account 컬럼 없음) DB 를 열 때 기존 행이 귀속될 계정 이름 (기본 DEFAULT_ACCOUNT).
+    def __init__(self, path: str, legacy_account: str | None = None, schema: str = DEFAULT_PG_SCHEMA):
+        """path: SQLite 파일 경로 또는 Postgres URL(postgres://…). schema: Postgres 전용 스키마 이름.
+        legacy_account: 1단계(account 컬럼 없음) SQLite DB 를 열 때 기존 행이 귀속될 계정 이름 (기본 DEFAULT_ACCOUNT).
         이미 마이그레이션된 DB 에는 영향이 없다."""
         self.path = path
         self.legacy_account = str(legacy_account or DEFAULT_ACCOUNT)
-        d = os.path.dirname(path)
-        if d:
-            os.makedirs(d, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=30)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+        if is_postgres_url(path):
+            self.backend = "postgres"
+            self.schema = schema or DEFAULT_PG_SCHEMA
+            self._conn = _PgConn(path, self.schema)
+            self._rowid = "event_id"                       # Postgres 에는 rowid 가 없다 → 같은 ms 안에서는 event_id 순
+            self._contains_body = "position(? in body) > 0"   # bytea 포함 검색
+        else:
+            self.backend = "sqlite"
+            self.schema = ""
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=30)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._rowid = "rowid"
+            self._contains_body = "instr(body, ?) > 0"
         with self._lock:
-            self._migrate_signals_pk()
-            self._migrate_fills_applied()
-            self._migrate_accounts_v2()
+            if self.backend == "sqlite":
+                self._migrate_signals_pk()
+                self._migrate_fills_applied()
+                self._migrate_accounts_v2()
             self._conn.executescript(SCHEMA)
             if self.get_meta("schema_version") is None:
                 self.set_meta("schema_version", SCHEMA_VERSION)
+
+    # ------------------------------------------------------------------ backend info
+    def describe(self) -> str:
+        """`sqlite state/lake.db` 또는 `postgres host:port/db schema=…` (비밀번호 없음)."""
+        if self.backend == "postgres":
+            return f"{describe_target(self.path)} schema={self.schema}"
+        return describe_target(self.path)
+
+    def ping_ms(self) -> float:
+        """원장 왕복 시간(ms). Postgres 는 연결 상태 확인을 겸한다 (LedgerUnavailable 가능)."""
+        with self._lock:
+            if self.backend == "postgres":
+                return self._conn.ping_ms()
+            t = time.monotonic()
+            self._conn.execute("SELECT 1").fetchone()
+            return (time.monotonic() - t) * 1000.0
+
+    @property
+    def reconnects(self) -> int:
+        return int(getattr(self._conn, "reconnects", 0) or 0)
 
     # ------------------------------------------------------------------ migrations
     def _table_exists(self, name: str) -> bool:
@@ -443,7 +645,8 @@ class Store:
         """가장 오래된 accepted 신호를 processing 으로 바꾸고 반환 (없으면 None)."""
         with self._tx():
             cur = self._conn.execute(
-                "SELECT * FROM signals WHERE status=? ORDER BY received_at_ms ASC, rowid ASC LIMIT 1", (SIGNAL_ACCEPTED,))
+                f"SELECT * FROM signals WHERE status=? ORDER BY received_at_ms ASC, {self._rowid} ASC LIMIT 1",
+                (SIGNAL_ACCEPTED,))
             r = cur.fetchone()
             if r is None:
                 return None
@@ -601,9 +804,15 @@ class Store:
                      order_id: str | None = None, raw: str | None = None, *, account: str) -> None:
         t = now_ms()
         with self._tx():
+            # ON CONFLICT … DO UPDATE 는 SQLite(3.24+) 와 Postgres 양쪽에서 같은 의미 (INSERT OR REPLACE 는 SQLite 전용)
             self._conn.execute(
-                "INSERT OR REPLACE INTO orders(order_link_id,account,mode,event_id,position_id,purpose,side,qty,reduce_only,"
-                "order_id,status,trigger_price,created_at_ms,updated_at_ms,raw) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO orders(order_link_id,account,mode,event_id,position_id,purpose,side,qty,reduce_only,"
+                "order_id,status,trigger_price,created_at_ms,updated_at_ms,raw) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(account,order_link_id) DO UPDATE SET mode=excluded.mode, event_id=excluded.event_id, "
+                "position_id=excluded.position_id, purpose=excluded.purpose, side=excluded.side, qty=excluded.qty, "
+                "reduce_only=excluded.reduce_only, order_id=excluded.order_id, status=excluded.status, "
+                "trigger_price=excluded.trigger_price, created_at_ms=excluded.created_at_ms, "
+                "updated_at_ms=excluded.updated_at_ms, raw=excluded.raw",
                 (order_link_id, account, mode, event_id, position_id, purpose, side, float(qty), 1 if reduce_only else 0,
                  order_id, status, trigger_price, t, t, raw))
 
@@ -765,7 +974,7 @@ class Store:
     def list_signals(self, mode: str | None = None, status: str | None = None, limit: int = 50,
                      offset: int = 0) -> list[dict]:
         where, params = self._where([("mode", mode), ("status", status)])
-        return self._q(f"SELECT {self._SIGNAL_COLS} FROM signals{where} ORDER BY received_at_ms DESC, rowid DESC "
+        return self._q(f"SELECT {self._SIGNAL_COLS} FROM signals{where} ORDER BY received_at_ms DESC, {self._rowid} DESC "
                        "LIMIT ? OFFSET ?", (*params, int(limit), int(offset)))
 
     def signal_counts(self) -> list[dict]:
@@ -795,7 +1004,7 @@ class Store:
         반환 행에는 body 대신 body_len 과 본문에서 읽은 execution_status 만 싣는다."""
         needle = ('"event_id":"%s"' % event_id).encode("utf-8")
         rows = self._q("SELECT report_id,mode,account,sequence,kind,created_at_ms,sent_at_ms,http_status,attempts,state,"
-                       "note,body FROM reports WHERE mode=? AND instr(body, ?) > 0 ORDER BY sequence LIMIT ?",
+                       f"note,body FROM reports WHERE mode=? AND {self._contains_body} ORDER BY sequence LIMIT ?",
                        (mode, needle, int(limit)))
         out = []
         for r in rows:
@@ -835,6 +1044,9 @@ class _Tx:
         try:
             if exc_type is None:
                 self.s._conn.execute("COMMIT")
+            elif getattr(self.s._conn, "broken", False):
+                # Postgres 연결이 트랜잭션 중에 끊김: 서버가 이미 롤백했으므로 상태만 정리한다
+                self.s._conn.rollback_quiet()
             else:
                 self.s._conn.execute("ROLLBACK")
         finally:

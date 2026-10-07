@@ -117,6 +117,7 @@ class _Ctx:
     exchange: ExchangeBase | None = None
     sig: Signal | None = None
     expired: bool = False               # process() 가 팬아웃 전에 한 번 판정한 만료 여부 (계정 간 일관)
+    stale: bool = False                 # 만료됐지만 정책(guards.expired_actions_execute) 에 따라 실행하는 중 (run note 에 남긴다)
 
     @property
     def is_long(self) -> bool:
@@ -273,16 +274,36 @@ class Executor:
         return True
 
     def run_forever(self, stop_event: threading.Event) -> None:
-        """0.2s 폴링 루프. process 내부 예외는 process 가 삼키고, claim 자체의 예외도 루프를 죽이지 않는다."""
+        """0.2s 폴링 루프. process 내부 예외는 process 가 삼키고, claim 자체의 예외도 루프를 죽이지 않는다.
+        원장(Postgres) 이 닿지 않으면(LedgerUnavailable) 1→2→4→…→30초 백오프로 재시도하고, 같은 종류의 오류 알림은
+        5분에 한 번만 보낸다 (장애 동안 알림 폭주 방지). 복구되면 '회복' 알림 한 번."""
         log.info("executor loop started")
+        backoff = 1.0
+        last_alert: dict[str, int] = {}
+        failing: str | None = None
         while not stop_event.is_set():
             try:
                 worked = self.run_once()
             except Exception as e:  # noqa: BLE001 - 루프는 절대 죽지 않는다
-                log.exception("executor loop error: %s", type(e).__name__)
-                self._alert(f"[executor] loop error: {type(e).__name__}")
-                stop_event.wait(1.0)
+                kind = type(e).__name__
+                unavailable = isinstance(e, st.LedgerUnavailable)
+                if unavailable:
+                    log.warning("executor loop: ledger unavailable (%s); retry in %.0fs", e, backoff)
+                else:
+                    log.exception("executor loop error: %s", kind)
+                now = now_ms()
+                if now - last_alert.get(kind, 0) >= 300_000:
+                    last_alert[kind] = now
+                    self._alert(f"[executor] loop error: {kind}" + (" (ledger unavailable, retrying)" if unavailable else ""))
+                failing = kind
+                stop_event.wait(backoff)
+                backoff = min(backoff * 2, 30.0)
                 continue
+            if failing is not None:
+                log.info("executor loop recovered after %s", failing)
+                self._alert(f"[executor] loop recovered after {failing}")
+                failing = None
+            backoff = 1.0
             if not worked:
                 stop_event.wait(0.2)
         log.info("executor loop stopped")
@@ -553,10 +574,17 @@ class Executor:
         self._report(ctx, "acknowledged")
 
         # ---- 만료 (접수 뒤 지연: 재시작/백로그/HALT 해제 뒤 오래된 신호를 현재가로 실행하지 않는다)
-        # 판정은 process() 가 팬아웃 전에 한 번 했다 (ctx.expired) — 모든 대상 계정에 같은 결과
+        # 판정은 process() 가 팬아웃 전에 한 번 했다 (ctx.expired) — 모든 대상 계정에 같은 결과.
+        # 예외: guards.expired_actions_execute 에 든 action(기본 partial_exit/full_exit/protection_update) 은 늦게라도 실행한다
+        # (서버 끊김·재시작 뒤 재연결 복구: 청산·보호가격 변경을 버리는 쪽이 더 위험). run note 에 stale 로 남는다.
         if ctx.expired:
-            self._reject(ctx, "EXPIRED", f"expired_at_ms={sig.expires_at_ms}")
-            return
+            if sig.action.value in self._expired_actions_execute():
+                ctx.stale = True
+                log.warning("%s: expired (expires_at_ms=%s) but executing per expired_actions_execute policy",
+                            ctx.tag(), sig.expires_at_ms)
+            else:
+                self._reject(ctx, "EXPIRED", f"expired_at_ms={sig.expires_at_ms}")
+                return
 
         # ---- 모드 게이트 (§1) — 계정별
         if mode == "test":
@@ -767,8 +795,17 @@ class Executor:
         self._set_result(ctx, st.SIGNAL_REJECTED, code, note)
 
     def _set_result(self, ctx: _Ctx, status: str, reason_code: str | None, note: str) -> None:
-        """계정별 run 결과. signals.status 종합은 process()/recover_processing() 끝 또는 _finalize_signal 호출자가 한다."""
+        """계정별 run 결과. signals.status 종합은 process()/recover_processing() 끝 또는 _finalize_signal 호출자가 한다.
+        만료 뒤 정책으로 실행한 신호(ctx.stale) 는 note 앞에 'stale' 표시를 남긴다 (대시보드/원장에서 구분)."""
+        if getattr(ctx, "stale", False):
+            note = f"stale(executed after expires_at_ms) {note}".strip()
         self.store.set_run_result(ctx.mode, ctx.event_id, ctx.account, status, reason_code, note)
+
+    def _expired_actions_execute(self) -> set[str]:
+        try:
+            return {str(a) for a in (getattr(self.settings, "expired_actions_execute", None) or ())}
+        except TypeError:
+            return set()
 
     def _opposing_leg_open(self, ctx: _Ctx) -> bool:
         """단방향(idx 0) 에서 반대 방향 lot 이 열려 있으면 True (거래소가 네팅해 버리므로 entry/add 거부)."""

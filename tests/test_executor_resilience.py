@@ -383,7 +383,12 @@ def test_partially_filled_canceled_is_cancelled_with_ioc_partial_note(fexecutor,
     t0 = time.monotonic()
     row = run_signal(fexecutor, store, _long_entry(pid, stop_loss=85000))
     elapsed = time.monotonic() - t0
-    assert elapsed < settings.fill_poll_timeout_s          # 타임아웃까지 기다리지 않는다
+    # 타임아웃까지 기다리지 않는다. 원격 Postgres(LAKE_TEST_DATABASE_URL) 로 돌리면 쿼리마다 왕복이 붙으므로
+    # 그 왕복 시간 × 넉넉한 쿼리 수만큼 예산을 더한다 (SQLite 에서는 0).
+    budget = settings.fill_poll_timeout_s
+    if getattr(store, "backend", "sqlite") == "postgres":
+        budget += 300 * (store.ping_ms() / 1000.0)
+    assert elapsed < budget, (elapsed, budget)
     assert row["status"] == "done" and row["reason_code"] is None
     assert "IOC_PARTIAL" in row["note"] and "QTY_MISMATCH" in row["note"]
     lot = store.get_lot("test", "bybit", pid)

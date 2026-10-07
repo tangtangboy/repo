@@ -1,0 +1,9 @@
+[Unit]
+Description=run lake-executor self-update when state/DEPLOY_NOW appears (dashboard "Deploy from GitHub now")
+
+[Path]
+PathExists=/home/ubuntu/lake-executor/state/DEPLOY_NOW
+Unit=lake-executor-update.service
+
+[Install]
+WantedBy=multi-user.target

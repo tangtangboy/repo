@@ -664,6 +664,13 @@ def compare(local_store: Any, target_store: Any) -> dict[str, tuple[int, int]]:
     tgt = _Target(target_store)
     out = {}
     for t in local_store.replicated_tables():
+        if t == "meta":   # 링크 메타(replica_*) 는 복제되지 않으므로 양쪽 모두 빼고 센다
+            with local_store._lock:
+                a = int(local_store._conn.execute("SELECT COUNT(*) FROM meta WHERE key NOT LIKE 'replica%'").fetchone()[0])
+            with target_store._lock:
+                b = int(target_store._conn.execute("SELECT COUNT(*) FROM meta WHERE key NOT LIKE 'replica%'").fetchone()[0])
+            out[t] = (a, b)
+            continue
         out[t] = (local_store.count_rows(t), tgt.row_count(t))
     return out
 

@@ -231,6 +231,19 @@ def cmd_serve(args: argparse.Namespace) -> int:
         raise
     executor = Executor(settings, store, exchanges, reporter, alerts)
 
+    # test 모드 가상거래소는 상태가 메모리뿐 → 장부의 열린 lot 으로 포지션을 되살린다 (재시작 뒤 RECONCILE_REQUIRED 방지)
+    for name, ex in (exchanges.get("test") or {}).items():
+        seed = getattr(ex, "seed_positions", None)
+        if callable(seed):
+            try:
+                lots = store.open_lots("test", name)
+                pos = seed(lots)
+                if lots:
+                    log.info("test exchange %s: seeded %d open lot(s) -> positions %s", name, len(lots),
+                             {i: (p["side"], p["size"]) for i, p in pos.items()})
+            except Exception as e:  # noqa: BLE001
+                log.warning("test exchange %s: seeding from open lots failed: %s", name, type(e).__name__)
+
     # 시작 시 계정 설정(live 에서만) — 실패해도 서비스는 올린다 (주문은 거래소가 거부하고 회신으로 드러남)
     try:
         executor.ensure_account_setup()

@@ -557,6 +557,40 @@ class PaperExchange(ExchangeBase):
             self.position_protections.clear()
             self.protection_events.clear()
 
+    def seed_positions(self, lots: list[dict]) -> dict[int, dict]:
+        """재시작 복구: 장부의 열린 lot 들로 가상 포지션을 다시 만든다 (test 모드는 거래소 상태가 메모리뿐이라 재시작 때 사라지고,
+        그러면 lot 과 어긋나 RECONCILE_REQUIRED 로 모든 test 신호가 거부된다). position_idx 별로 수량 합·가중 평균가.
+        leg long → Buy, short → Sell. 포지션 단위 보호(SL/TP) 는 lot 의 값으로 복원하고, lot 단위 보호주문은 대사가 다시 만든다."""
+        agg: dict[int, dict] = {}
+        for lot in lots or []:
+            if str(lot.get("status", "open")) != "open":
+                continue
+            qty = float(lot.get("qty") or 0.0)
+            if qty <= 0:
+                continue
+            idx = int(lot.get("position_idx") or 0)
+            side = "Buy" if str(lot.get("leg") or "long") == "long" else "Sell"
+            avg = float(lot.get("avg_entry") or 0.0) or self._price
+            a = agg.setdefault(idx, {"size": 0.0, "cost": 0.0, "side": side})
+            if a["side"] != side:          # 같은 idx 에 양방향 lot 은 one_way(idx 0) 에서만 가능 — 순수량으로 합친다
+                a["size"] -= qty
+                a["cost"] -= avg * qty
+            else:
+                a["size"] += qty
+                a["cost"] += avg * qty
+        step = self._instr["qty_step"]
+        with self._lock:
+            self._positions.clear()
+            for idx, a in agg.items():
+                raw = a["size"]
+                side = a["side"] if raw >= 0 else ("Buy" if a["side"] == "Sell" else "Sell")
+                avg = abs(a["cost"]) / abs(raw) if raw else self._price      # 평균가는 내림 전 수량 기준
+                size = floor_step(abs(raw) + step / 4, step)
+                if size <= step / 2:
+                    continue
+                self._positions[idx] = {"size": size, "side": side, "avg_price": avg, "updated_time_ms": self._clock()}
+            return {idx: dict(p) for idx, p in self._positions.items()}
+
     def set_price(self, price: float, mark: float | None = None) -> list[dict]:
         """시세 갱신. 트리거된 조건부 주문을 체결하고 그 주문(get_order 형식) 목록을 돌려준다."""
         p = float(price)

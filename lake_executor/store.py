@@ -132,6 +132,7 @@ class _PgConn:
                     if create_schema:
                         cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
                     cur.execute(f'SET search_path TO "{self.schema}"')
+                    cur.execute("SET extra_float_digits = 3")   # Supabase 기본 0 → float8 이 15자리로 잘려 읽힘; 3 = 정확한 왕복
                 if getattr(self, "_connected_once", False):
                     self.reconnects += 1
                 self._connected_once = True

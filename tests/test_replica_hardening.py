@@ -143,11 +143,12 @@ def test_poison_row_is_quarantined_and_replication_continues(local, local_path, 
     stop = threading.Event()
     th = threading.Thread(target=rep.run_forever, args=(stop,), daemon=True)
     th.start()
-    deadline = time.monotonic() + 20
+    slow = 12 if PG_URL else 1                                       # Postgres: 격리는 행마다 왕복 (수십 초)
+    deadline = time.monotonic() + 20 * slow
     while time.monotonic() < deadline and local.repl_queue_len() > 0:
         time.sleep(0.05)
     stop.set()
-    th.join(10)
+    th.join(10 * slow)
     assert not th.is_alive()
     assert local.repl_queue_len() == 0
     assert local.repl_dead_count() == 1 and local.repl_dead_rows()[0]["row"]["key"] == "poison"
@@ -202,7 +203,10 @@ def test_real_values_replicate_bit_exact_and_stray_blob_in_text_column(local, lo
         assert [r["unrealised_pnl"] for r in t.account_equity_series("test", "acct")] == [-v for v in vals]
         with t._lock:
             raw = t._conn.execute("SELECT value FROM meta WHERE key='blobby'").fetchone()[0]
-        assert bytes(raw) == b"\x00\xffraw"
+        if t.backend == "sqlite":
+            assert bytes(raw) == b"\x00\xffraw"
+        else:                                                       # Postgres TEXT 열은 bytes 를 담을 수 없다 → bytea 의 텍스트 표기
+            assert isinstance(raw, str) and "00ff" in raw.lower()
     finally:
         rep.close()
 

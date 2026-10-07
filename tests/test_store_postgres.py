@@ -192,3 +192,24 @@ def test_reconnects_after_connection_drop(pg):
             pg._conn.execute("SELECT 1")
     assert pg.get_meta("schema_version") == "2"            # 그 뒤 정상
     assert pg.reconnects == 2
+
+
+def test_signal_log_append_rows_and_export(pg):
+    from lake_executor import signal_log as sl
+    sig, raw = _signal()
+    accounts = [{"name": "bybit", "exchange": "bybit", "enabled": True, "symbol": "BTCUSDT", "leverage": 5,
+                 "margin_mode": "isolated", "position_mode": "hedge", "qty_multiplier": 1.0, "live_possible": False}]
+    row = sl.signal_to_row(sig, "new", now_ms(), accounts)
+    row.update({"mark_price": 80000.0, "last_price": 80001.0, "price_at_ms": now_ms(), "price_source": "stub"})
+    assert pg.append_signal_log(row) is True and pg.append_signal_log(row) is False
+    got = pg.signal_log_rows(mode="test")[0]
+    assert got["mark_price"] == 80000.0 and got["accounts"][0]["name"] == "bybit" and pg.signal_log_count() == 1
+    assert pg.insert_signal(sig, raw, now_ms()) == "new"
+    pg.set_run_result("test", sig.event_id, "bybit", st.SIGNAL_DONE, None, "ok")
+    pg.finalize_signal("test", sig.event_id)
+    pg.insert_fill("x9", "test", sig.position_id, 0.001, 80010.0, now_ms(), order_id="o9", order_link_id="l9",
+                   event_id=sig.event_id, account="bybit")
+    ex = pg.export_signal_rows(mode="test")
+    assert len(ex) == 1 and ex[0]["fill_avg_price"] == 80010.0 and ex[0]["run_status"] == "done"
+    assert ex[0]["account_leverage"] == 5 and ex[0]["signal_status"] == "done"
+    assert sl.rows_to_csv(ex).splitlines()[0] == ",".join(sl.EXPORT_COLUMNS)

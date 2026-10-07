@@ -323,7 +323,45 @@ CREATE TABLE IF NOT EXISTS ingress_log (
   note TEXT
 )""",
     "meta": "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
+    # 라이브 신호 로그 (백테스트용 데이터셋). 주문 경로 밖에서 signal_log.py 의 백그라운드 스레드가 쓴다 (append-only).
+    # 수신 시각·신호가 말한 가격·수신 순간의 시장가·수량·계정 사이징 문맥을 한 행에 담는다. (mode, event_id) 로 중복 제거.
+    "signal_log": """
+CREATE TABLE IF NOT EXISTS signal_log (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  received_at_ms         INTEGER NOT NULL,
+  mode                   TEXT NOT NULL,
+  event_id               TEXT NOT NULL,
+  position_id            TEXT NOT NULL,
+  event_sequence         INTEGER NOT NULL,
+  strategy               TEXT NOT NULL,
+  strategy_name          TEXT,
+  action                 TEXT NOT NULL,
+  leg                    TEXT NOT NULL,
+  position_idx           INTEGER NOT NULL,
+  exchange               TEXT,
+  symbol                 TEXT,
+  qty_btc                REAL,
+  expected_qty_btc_after REAL,
+  reference_price        REAL,
+  stop_loss              REAL,
+  take_profit            TEXT,
+  protection_revision    INTEGER,
+  signal_ts              INTEGER,
+  expires_at_ms          INTEGER,
+  ingest_result          TEXT NOT NULL,
+  mark_price             REAL,
+  last_price             REAL,
+  price_at_ms            INTEGER,
+  price_source           TEXT,
+  accounts               TEXT,
+  UNIQUE (mode, event_id)
+)""",
 }
+
+SIGNAL_LOG_COLS = ("received_at_ms", "mode", "event_id", "position_id", "event_sequence", "strategy", "strategy_name",
+                   "action", "leg", "position_idx", "exchange", "symbol", "qty_btc", "expected_qty_btc_after",
+                   "reference_price", "stop_loss", "take_profit", "protection_revision", "signal_ts", "expires_at_ms",
+                   "ingest_result", "mark_price", "last_price", "price_at_ms", "price_source", "accounts")
 
 INDEXES: dict[str, list[tuple[str, str]]] = {   # table -> [(index name, DDL)]
     "signals": [("ix_signals_status", "CREATE INDEX IF NOT EXISTS ix_signals_status ON signals(status, received_at_ms)")],
@@ -331,6 +369,7 @@ INDEXES: dict[str, list[tuple[str, str]]] = {   # table -> [(index name, DDL)]
     "orders": [("ix_orders_pos", "CREATE INDEX IF NOT EXISTS ix_orders_pos ON orders(mode, account, position_id, status)")],
     "fills": [("ix_fills_link", "CREATE INDEX IF NOT EXISTS ix_fills_link ON fills(account, order_link_id)")],
     "reports": [("ix_reports_state", "CREATE INDEX IF NOT EXISTS ix_reports_state ON reports(mode, account, state, sequence)")],
+    "signal_log": [("ix_signal_log_time", "CREATE INDEX IF NOT EXISTS ix_signal_log_time ON signal_log(mode, received_at_ms)")],
 }
 
 # 계정 컬럼이 추가된 테이블 (1단계 → 2 마이그레이션 대상, 이 순서로)
@@ -1025,6 +1064,106 @@ class Store:
 
     def report_counts(self) -> list[dict]:
         return self._q("SELECT mode,state,COUNT(*) AS n FROM reports GROUP BY mode,state ORDER BY mode,state")
+
+    # ------------------------------------------------------------------ 라이브 신호 로그 (signal_log.py 가 쓰고, export/대시보드가 읽는다)
+    def append_signal_log(self, row: dict) -> bool:
+        """한 행 추가. 같은 (mode, event_id) 가 이미 있으면 False (재전송/중복 접수는 첫 기록만 남긴다)."""
+        vals = []
+        for c in SIGNAL_LOG_COLS:
+            v = row.get(c)
+            if c in ("take_profit", "accounts") and v is not None and not isinstance(v, str):
+                v = json.dumps(v, ensure_ascii=False)
+            vals.append(v)
+        with self._tx():
+            cur = self._conn.execute(
+                f"INSERT OR IGNORE INTO signal_log({','.join(SIGNAL_LOG_COLS)}) VALUES({','.join('?' * len(SIGNAL_LOG_COLS))})",
+                tuple(vals))
+            return cur.rowcount == 1
+
+    @staticmethod
+    def _signal_log_where(mode: str | None, since_ms: int | None, until_ms: int | None) -> tuple[str, list]:
+        parts, params = [], []
+        if mode is not None:
+            parts.append("mode=?"); params.append(mode)
+        if since_ms is not None:
+            parts.append("received_at_ms>=?"); params.append(int(since_ms))
+        if until_ms is not None:
+            parts.append("received_at_ms<?"); params.append(int(until_ms))
+        return (" WHERE " + " AND ".join(parts)) if parts else "", params
+
+    def signal_log_rows(self, mode: str | None = None, since_ms: int | None = None, until_ms: int | None = None,
+                        limit: int = 200, offset: int = 0, ascending: bool = False) -> list[dict]:
+        where, params = self._signal_log_where(mode, since_ms, until_ms)
+        order = "ASC" if ascending else "DESC"
+        rows = self._q(f"SELECT * FROM signal_log{where} ORDER BY received_at_ms {order}, id {order} LIMIT ? OFFSET ?",
+                       (*params, int(limit), int(offset)))
+        for r in rows:
+            r["take_profit"] = _loads(r.get("take_profit"))
+            r["accounts"] = _loads(r.get("accounts")) or []
+        return rows
+
+    def signal_log_count(self, mode: str | None = None) -> int:
+        where, params = self._signal_log_where(mode, None, None)
+        r = self._q1(f"SELECT COUNT(*) AS n FROM signal_log{where}", tuple(params))
+        return int(r["n"]) if r else 0
+
+    def export_signal_rows(self, mode: str | None = None, since_ms: int | None = None, until_ms: int | None = None,
+                           limit: int = 100000) -> list[dict]:
+        """백테스트용 평면 행: signal_log × 계정별 실행(run) + 체결 집계. 계정이 여러 개면 계정마다 한 행,
+        run 이 없으면(미처리/거부) account 가 빈 한 행. 열 정의는 signal_log.EXPORT_COLUMNS."""
+        base = self.signal_log_rows(mode, since_ms, until_ms, limit=limit, offset=0, ascending=True)
+        if not base:
+            return []
+        modes = sorted({r["mode"] for r in base})
+        lo = min(r["received_at_ms"] for r in base)
+        sig_status: dict[tuple[str, str], dict] = {}
+        runs: dict[tuple[str, str], list[dict]] = {}
+        fills: dict[tuple[str, str, str], dict] = {}
+        for m in modes:
+            for s in self._q("SELECT mode,event_id,status,reason_code,processed_at_ms,note FROM signals "
+                             "WHERE mode=? AND received_at_ms>=?", (m, lo)):
+                sig_status[(m, s["event_id"])] = s
+            for r in self._q("SELECT mode,event_id,account,status,reason_code,note,processed_at_ms FROM signal_runs "
+                             "WHERE mode=? AND processed_at_ms>=? ORDER BY account", (m, lo)):
+                runs.setdefault((m, r["event_id"]), []).append(r)
+            for f in self._q("SELECT mode,event_id,account,SUM(qty) AS fill_qty,SUM(qty*price) AS notional,"
+                             "COUNT(*) AS fill_count,MIN(exec_time_ms) AS first_fill_ms,MAX(exec_time_ms) AS last_fill_ms "
+                             "FROM fills WHERE mode=? AND event_id IS NOT NULL AND exec_time_ms>=? GROUP BY mode,event_id,account",
+                             (m, lo)):
+                fills[(m, f["event_id"], f["account"])] = f
+        out: list[dict] = []
+        for r in base:
+            key = (r["mode"], r["event_id"])
+            s = sig_status.get(key) or {}
+            acct_ctx = {a.get("name"): a for a in (r.get("accounts") or []) if isinstance(a, dict)}
+            rlist = runs.get(key) or [{}]
+            for run in rlist:
+                account = run.get("account") or ""
+                f = fills.get((r["mode"], r["event_id"], account)) or {}
+                fq = float(f.get("fill_qty") or 0.0)
+                ctx = acct_ctx.get(account) or {}
+                first_fill = f.get("first_fill_ms")
+                row = dict(r)
+                row.pop("id", None)
+                row.pop("accounts", None)
+                row.update({
+                    "signal_status": s.get("status"), "signal_reason": s.get("reason_code"),
+                    "processed_at_ms": s.get("processed_at_ms"),
+                    "processing_ms": (int(s["processed_at_ms"]) - int(r["received_at_ms"])) if s.get("processed_at_ms") else None,
+                    "latency_signal_to_receipt_ms": (int(r["received_at_ms"]) - int(r["signal_ts"])) if r.get("signal_ts") else None,
+                    "account": account, "run_status": run.get("status"), "run_reason": run.get("reason_code"),
+                    "run_note": run.get("note"),
+                    "fill_qty": fq if f else None,
+                    "fill_avg_price": (float(f["notional"]) / fq) if f and fq > 0 else None,
+                    "fill_count": int(f.get("fill_count") or 0) if f else None,
+                    "first_fill_ms": first_fill, "last_fill_ms": f.get("last_fill_ms"),
+                    "fill_latency_ms": (int(first_fill) - int(r["received_at_ms"])) if first_fill else None,
+                    "account_exchange": ctx.get("exchange"), "account_leverage": ctx.get("leverage"),
+                    "account_margin_mode": ctx.get("margin_mode"), "account_position_mode": ctx.get("position_mode"),
+                    "account_qty_multiplier": ctx.get("qty_multiplier"), "account_live_possible": ctx.get("live_possible"),
+                })
+                out.append(row)
+        return out
 
 
 class _Tx:

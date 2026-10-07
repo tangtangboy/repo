@@ -444,8 +444,9 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
             return _reject_response(_Reject(400, "INVALID_SIGNAL", "UNPROCESSABLE"), raw)
 
         # 7) 영속 접수
+        received_at = now_ms()
         try:
-            result = store.insert_signal(sig, raw, now_ms())
+            result = store.insert_signal(sig, raw, received_at)
         except st.LedgerUnavailable as e:
             # 원장(Postgres) 불통: 접수하지 못했으니 503 + Retry-After — lake 는 재전송한다 (2xx 가 아니므로 접수된 게 아님)
             log.error("insert_signal: ledger unavailable (%s)", e)
@@ -455,6 +456,15 @@ def create_app(settings: Any, store: st.Store, services: Any = None) -> FastAPI:
         except Exception as e:  # noqa: BLE001 - DB 장애: 상대는 재전송해야 하므로 5xx
             log.error("insert_signal failed: %s", type(e).__name__)
             return _json(500, {"error": "INTERNAL", "code": "STORE_ERROR"})
+
+        # 라이브 신호 로그 (백테스트용): 큐에 넣기만 한다 — 주문 경로를 기다리게 하지 않고, 실패해도 응답에 영향 없음
+        if result in ("new", "duplicate"):
+            slog = _svc(services, "signal_log")
+            if slog is not None:
+                try:
+                    slog.record(sig, result, received_at)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("signal_log.record failed: %s", type(e).__name__)
 
         if result == "new":
             log.info("signal accepted mode=%s event_id=%s position_id=%s seq=%s action=%s",

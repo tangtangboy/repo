@@ -684,8 +684,8 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
 
     # ------------------------------------------------------------------ 페이지 틀
     NAV = [("/ui", "Overview"), ("/ui/signals", "Signals"), ("/ui/orders", "Orders"), ("/ui/reports", "Reports"),
-           ("/ui/ingress", "Ingress"), ("/ui/accounts", "Accounts"), ("/ui/secrets", "Secrets"),
-           ("/ui/controls", "Controls")]
+           ("/ui/ingress", "Ingress"), ("/ui/signal-log", "Signal log"), ("/ui/accounts", "Accounts"),
+           ("/ui/secrets", "Secrets"), ("/ui/controls", "Controls")]
 
     def _head(title: str, refresh: int | None = None) -> str:
         meta = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
@@ -1126,6 +1126,80 @@ def mount(app: FastAPI, settings: Any, store: Any, services: Any, admin_throttle
                     + '<p class="muted">pre-auth rejections are counters only (reset on restart); nothing is written to the DB.</p>'
                     + ctable)
             return _html(200, _page("Ingress", body, active=f"{UI_PREFIX}/ingress", session=session))
+        return _run(_impl, session)
+
+    # ------------------------------------------------------------------ 라이브 신호 로그 (백테스트용 데이터셋)
+    def _signal_log_filters(request: Request) -> tuple[str | None, int | None, int | None]:
+        mode = _filter(request, "mode", tuple(MODES))
+        since = until = None
+        for name in ("since", "until"):
+            v = _q(request, name)
+            if v:
+                try:
+                    from .main import parse_when
+                    ms = parse_when(v)
+                except ValueError:
+                    raise UiError(400, "BAD_REQUEST", f"{name}: use YYYY-MM-DD, YYYY-MM-DDTHH:MM or Unix ms") from None
+                if name == "since":
+                    since = ms
+                else:
+                    until = ms
+        return mode, since, until
+
+    @app.get(f"{UI_PREFIX}/signal-log")
+    def ui_signal_log(request: Request):
+        g = _gate(request)
+        if isinstance(g, Response):
+            return g
+        session = g
+
+        def _impl() -> Response:
+            mode, since, until = _signal_log_filters(request)
+            limit, offset = _paging(request)
+            rows = store.signal_log_rows(mode, since, until, limit=limit + 1, offset=offset)
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            slog = rcv._svc(services, "signal_log")
+            stats = slog.snapshot() if slog is not None and hasattr(slog, "snapshot") else {}
+            table = _table(
+                ["received_at", "mode", "event_id", "action", "leg", "qty_btc", "ref price", "mark @receipt", "last @receipt",
+                 "strategy", "ingest", "sl", "tp"],
+                [[_fmt_ms(r["received_at_ms"]), r["mode"], _event_link(r["event_id"], r["mode"]), r["action"], r["leg"],
+                  r.get("qty_btc"), r.get("reference_price"), r.get("mark_price"), r.get("last_price"), r.get("strategy"),
+                  _status(r.get("ingest_result")), r.get("stop_loss"), json.dumps(r.get("take_profit")) if r.get("take_profit") else ""]
+                 for r in rows])
+            q = {"mode": mode, "since": _q(request, "since"), "until": _q(request, "until")}
+            dl = urllib.parse.urlencode({k: v for k, v in q.items() if v})
+            filters = ("<form method=\"get\" class=\"filters\">"
+                       "<label>mode " + _select("mode", [(m, m) for m in MODES], blank="(all)") + "</label>"
+                       '<label>since <input type="text" name="since" placeholder="YYYY-MM-DD" autocomplete="off"></label>'
+                       '<label>until <input type="text" name="until" placeholder="YYYY-MM-DD" autocomplete="off"></label>'
+                       '<button type="submit">Filter</button></form>')
+            body = ("<h2>Live signal log (append-only, written off the trade path)</h2>"
+                    f"<p>total rows: {store.signal_log_count(mode)} · writer: "
+                    f"{_esc(' '.join(f'{k}={v}' for k, v in stats.items() if k not in ('jsonl',)))}</p>"
+                    f'<p><a href="{UI_PREFIX}/signal-log.csv?{_esc(dl)}">Download CSV</a> (joined with our runs/fills; '
+                    "columns = signal_log.EXPORT_COLUMNS) · CLI: <code>python -m lake_executor export --format csv</code></p>"
+                    + filters + table + _pager(f"{UI_PREFIX}/signal-log", q, limit, offset, has_more))
+            return _html(200, _page("Signal log", body, active=f"{UI_PREFIX}/signal-log", session=session))
+        return _run(_impl, session)
+
+    @app.get(f"{UI_PREFIX}/signal-log.csv")
+    def ui_signal_log_csv(request: Request):
+        g = _gate(request)
+        if isinstance(g, Response):
+            return g
+        session = g
+
+        def _impl() -> Response:
+            from .signal_log import rows_to_csv
+            mode, since, until = _signal_log_filters(request)
+            rows = store.export_signal_rows(mode, since, until, limit=50000)
+            text = rows_to_csv(rows)
+            name = f"signal_log_{mode or 'all'}_{now_ms()}.csv"
+            resp = Response(content=text, media_type="text/csv; charset=utf-8",
+                            headers={"Content-Disposition": f'attachment; filename="{name}"'})
+            return _with_headers(resp)
         return _run(_impl, session)
 
     # ------------------------------------------------------------------ .env 저장 공통

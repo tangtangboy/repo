@@ -191,9 +191,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
         log.exception("recover_processing failed: %s", type(e).__name__)
         alerts.send(f"[serve] recover_processing failed: {type(e).__name__}")
 
+    # 라이브 신호 로그: 전용 DB 연결(원장 락과 무관) + state/signal_log.jsonl. 수신기는 큐에 넣기만 한다.
+    from .signal_log import SignalLog
+    signal_log = SignalLog(
+        store_factory=lambda: Store(settings.ledger_target, legacy_account=settings.legacy_account_name(),
+                                    schema=settings.db_schema),
+        state_dir=settings.state_dir, settings=settings)
+
     # paths/started_ms 는 대시보드(web.py) 가 쓴다: .env/config.json 편집 대상 경로와 재시작 가드의 기준 시각
     services = SimpleNamespace(executor=executor, reporter=reporter, alerts=alerts, exchanges=exchanges,
-                               paths=SimpleNamespace(env=args.env, config=args.config), started_ms=now_ms())
+                               paths=SimpleNamespace(env=args.env, config=args.config), started_ms=now_ms(),
+                               signal_log=signal_log)
     app = create_app(settings, store, services)
 
     stop_event = threading.Event()
@@ -217,6 +225,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         threading.Thread(target=reporter.run_forever, args=(stop_event,), name="reporter", daemon=True),
         threading.Thread(target=_snapshot_loop, args=(settings, executor, exchanges, stop_event), name="snapshot",
                          daemon=True),
+        threading.Thread(target=signal_log.run_forever, args=(stop_event,), name="signal-log", daemon=True),
     ]
     for t in threads:
         t.start()
@@ -652,6 +661,49 @@ def _add_config_args(p: argparse.ArgumentParser, *, suppress: bool) -> None:
                    help=f".env path with secrets (default: {DEFAULT_ENV_PATH})")
 
 
+def parse_when(s: str | None) -> int | None:
+    """--since/--until: Unix ms, 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM[:SS]' (UTC) → ms."""
+    if s is None or str(s).strip() == "":
+        return None
+    s = str(s).strip()
+    if s.isdigit():
+        return int(s)
+    import datetime as _dt
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            d = _dt.datetime.strptime(s, fmt).replace(tzinfo=_dt.timezone.utc)
+            return int(d.timestamp() * 1000)
+        except ValueError:
+            continue
+    raise ValueError(f"cannot parse time {s!r} (use ms, YYYY-MM-DD or YYYY-MM-DDTHH:MM)")
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """라이브 신호 로그 내보내기 (백테스트 입력). signal_log × 계정별 실행 × 체결 집계 → CSV/JSONL."""
+    from .signal_log import rows_to_csv, rows_to_jsonl
+    from .store import Store
+    try:
+        settings = _load_settings(args)
+        since, until = parse_when(args.since), parse_when(args.until)
+    except (config.ConfigError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    store = Store(settings.ledger_target, legacy_account=settings.legacy_account_name(), schema=settings.db_schema)
+    try:
+        rows = store.export_signal_rows(mode=args.mode, since_ms=since, until_ms=until, limit=int(args.limit))
+    finally:
+        store.close()
+    text = rows_to_jsonl(rows) if args.format == "jsonl" else rows_to_csv(rows)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        print(f"{len(rows)} row(s) -> {args.out}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+        print(f"{len(rows)} row(s)", file=sys.stderr)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m lake_executor",
                                 description="lake-executor: lake webhook -> Bybit executor")
@@ -705,6 +757,16 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("--qty", type=float, default=None, help="override qty_btc")
     fp.add_argument("-y", "--yes", action="store_true", help="skip the LIVE confirmation prompt")
     fp.set_defaults(func=cmd_fire)
+
+    xp = sub.add_parser("export", help="export the live signal log (+ our runs/fills) as CSV or JSONL for backtesting")
+    _add_config_args(xp, suppress=True)
+    xp.add_argument("--mode", choices=["test", "live"], default=None, help="filter by mode (default: both)")
+    xp.add_argument("--since", default=None, help="UTC: YYYY-MM-DD, YYYY-MM-DDTHH:MM or Unix ms (inclusive)")
+    xp.add_argument("--until", default=None, help="UTC: same formats (exclusive)")
+    xp.add_argument("--format", choices=["csv", "jsonl"], default="csv")
+    xp.add_argument("--out", default=None, help="file path (default: stdout)")
+    xp.add_argument("--limit", default=100000, type=int)
+    xp.set_defaults(func=cmd_export)
     return p
 
 

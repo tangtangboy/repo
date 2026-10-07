@@ -198,6 +198,37 @@ AWS EC2(서울) + Elastic IP + Caddy(자동 HTTPS 443) → `127.0.0.1:8787` lake
 않는다(`EXPIRED` 거부) — 오래된 가격으로 새 포지션을 여는 것보다 청산·보호가격 변경을 버리는 쪽이 더 위험하기 때문이다. 빈 리스트로 두면
 예전처럼 전부 거부한다.
 
+## 라이브 신호 로그 (백테스트용 데이터셋)
+
+차트 백테스트는 실제로 받은 신호와 다르다. 그래서 **실시간으로 받은 신호를 받은 그대로** 한 줄씩 남긴다(`signal_log` 테이블 +
+`state/signal_log.jsonl`): 수신 시각, 신호가 말한 가격(`reference_price`), **수신 순간의 거래소 마크/현재가**(공개 티커), 방향·수량·손절·익절·전략,
+그리고 그때의 계정 사이징 문맥(레버리지·마진 모드·배수). 나중에 시드·레버리지·비중을 바꿔 재계산하는 입력으로 바로 쓴다.
+우리 체결 결과(`fills`) 는 내보낼 때 `event_id` 로 붙고, 거래소 트레이드 히스토리 API 와도 `event_id`/`order_link_id` 로 맞출 수 있다.
+
+**주문 경로와 분리돼 있다.** 수신기는 접수(202 / 200 duplicate) 직후 큐에 넣기만 하고(마이크로초, 예외 없음), 백그라운드 writer 가
+가격을 가져와 JSONL 과 DB 에 쓴다. DB 연결도 원장과 별도라 DB 가 느리거나 끊겨도 접수·주문은 기다리지 않는다
+(DB 가 안 되면 JSONL 에는 남고 재시도 뒤 통계에 `db_errors` 로 집계; 대시보드 Signal log 페이지의 writer 통계).
+
+내보내기:
+```bash
+python -m lake_executor export --mode live --since 2026-10-01 --format csv --out signals_live.csv   # UTC, --until 도 가능
+python -m lake_executor export --format jsonl                                                     # stdout
+```
+대시보드 **Signal log** 페이지의 **Download CSV** 도 같은 내용이다. 열(`signal_log.EXPORT_COLUMNS`, 순서 고정):
+
+| 열 | 뜻 |
+|---|---|
+| `received_at_ms`, `received_at` | 우리 서버가 받은 시각 (ms, ISO UTC) |
+| `mode`, `event_id`, `position_id`, `event_sequence`, `strategy`, `strategy_name`, `action`, `leg`, `position_idx`, `exchange`, `symbol` | 신호 본문 |
+| `qty_btc`, `expected_qty_btc_after`, `reference_price`, `stop_loss`, `take_profit`, `protection_revision`, `signal_ts`, `expires_at_ms` | 신호 본문 (가격·수량·보호) |
+| `mark_price`, `last_price`, `price_at_ms`, `price_source` | 수신 직후 공개 티커의 마크/현재가 (못 가져오면 빈칸) |
+| `latency_signal_to_receipt_ms` | 신호 `ts` → 우리 수신까지 (발신 지연) |
+| `ingest_result` | `new` / `duplicate` |
+| `signal_status`, `signal_reason`, `processed_at_ms`, `processing_ms` | 우리 처리 결과 (done/rejected/error, 사유, 처리 소요) |
+| `account`, `run_status`, `run_reason`, `run_note` | 계정별 실행 결과 (계정이 여러 개면 계정마다 한 행; 미처리면 빈 account 한 행) |
+| `fill_qty`, `fill_avg_price`, `fill_count`, `first_fill_ms`, `last_fill_ms`, `fill_latency_ms` | 우리 체결 집계 (수신 → 첫 체결까지) |
+| `account_exchange`, `account_leverage`, `account_margin_mode`, `account_position_mode`, `account_qty_multiplier`, `account_live_possible` | 그 시점의 계정 사이징 문맥 |
+
 ## 운영 대시보드 (/ui)
 
 서버에 올린 뒤 브라우저로 **`https://<PUBLIC_HOST>/ui`** 를 열면 SSH 나 `.env` 편집 없이 운영할 수 있다. 로그인은 `.env` 의 `ADMIN_TOKEN`
